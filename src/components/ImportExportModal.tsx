@@ -30,6 +30,9 @@ export const ImportExportModal: React.FC<ImportExportModalProps> = ({
 }) => {
   const [activeTab, setActiveTab] = useState<"import" | "xtream" | "director" | "export">("import");
   const [m3uText, setM3uText] = useState<string>("");
+  const [remoteUrl, setRemoteUrl] = useState<string>("https://iptv-org.github.io/iptv/languages/eng.m3u");
+  const [isFetchingUrl, setIsFetchingUrl] = useState<boolean>(false);
+  const [importStatus, setImportStatus] = useState<string | null>(null);
   const [xtreamServer, setXtreamServer] = useState<string>("http://iptv.provider.com:8080");
   const [xtreamUser, setXtreamUser] = useState<string>("demo");
   const [xtreamPass, setXtreamPass] = useState<string>("demo123");
@@ -40,14 +43,13 @@ export const ImportExportModal: React.FC<ImportExportModalProps> = ({
 
   if (!isOpen) return null;
 
-  // Handle M3U Paste
-  const handleParseM3U = () => {
-    if (!m3uText) return;
-    const lines = m3uText.split(/\r?\n/);
+  const parseRawM3U = (rawText: string): Episode[] => {
+    const lines = rawText.split(/\r?\n/);
     const parsed: Episode[] = [];
 
     let title = "";
     let group = "Imported";
+    let logo = "";
 
     for (const line of lines) {
       const trimmed = line.trim();
@@ -56,29 +58,69 @@ export const ImportExportModal: React.FC<ImportExportModalProps> = ({
         if (commaIdx !== -1) title = trimmed.substring(commaIdx + 1);
         const groupMatch = trimmed.match(/group-title="([^"]+)"/i);
         if (groupMatch) group = groupMatch[1];
+        const logoMatch = trimmed.match(/tvg-logo="([^"]+)"/i);
+        if (logoMatch) logo = logoMatch[1];
       } else if (trimmed.length > 0 && !trimmed.startsWith("#")) {
         parsed.push({
           id: "import-" + Math.random().toString(36).slice(2, 9),
           season: 1,
           episode: parsed.length + 1,
-          title: title || "Imported Channel",
+          title: title || "Imported Stream Channel",
           duration: 3600,
           url: trimmed,
           status: "valid",
           groupTitle: group,
+          tvgLogo: logo || undefined,
           contentType: "live",
           allowedPlayers: ["all"],
         });
         title = "";
+        logo = "";
       }
     }
+    return parsed;
+  };
+
+  // Handle M3U Paste
+  const handleParseM3U = () => {
+    if (!m3uText.trim()) return;
+    const parsed = parseRawM3U(m3uText);
 
     if (parsed.length > 0) {
       onImportEpisodes(parsed);
-      alert(`Successfully imported ${parsed.length} channels!`);
-      onClose();
+      setImportStatus(`Successfully parsed and loaded ${parsed.length} channels!`);
+      setTimeout(() => {
+        onClose();
+      }, 1000);
     } else {
-      alert("No valid #EXTINF channels found in text.");
+      setImportStatus("No valid #EXTINF channels found in text.");
+    }
+  };
+
+  // Handle Fetch Remote M3U URL
+  const handleFetchRemoteM3U = async (urlToFetch: string) => {
+    if (!urlToFetch.trim()) return;
+    setIsFetchingUrl(true);
+    setImportStatus("Fetching remote stream matrix...");
+    try {
+      const res = await fetch(urlToFetch, { signal: AbortSignal.timeout(8000) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const text = await res.text();
+      const parsed = parseRawM3U(text);
+      if (parsed.length > 0) {
+        onImportEpisodes(parsed);
+        setImportStatus(`Successfully ingested ${parsed.length} live channels from feed!`);
+        setTimeout(() => {
+          onClose();
+        }, 1200);
+      } else {
+        setImportStatus("Fetched file but found 0 channel entries.");
+      }
+    } catch (e: any) {
+      console.warn("Direct fetch error:", e);
+      setImportStatus("Direct CORS blocked. You can paste M3U text directly below.");
+    } finally {
+      setIsFetchingUrl(false);
     }
   };
 
@@ -173,22 +215,72 @@ export const ImportExportModal: React.FC<ImportExportModalProps> = ({
 
         {/* TAB 1: M3U IMPORT */}
         {activeTab === "import" && (
-          <div className="space-y-4">
+          <div className="space-y-4 font-mono">
+            {/* Quick 1-Click English Matrix Hydration */}
+            <div className="p-3 bg-[#0D121D] border border-[#0088FF]/30 rounded-2xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+              <div>
+                <div className="flex items-center gap-2 text-xs font-bold text-white">
+                  <Globe className="w-4 h-4 text-[#0088FF]" />
+                  <span>TV Explorer / IPTV-Org English Live Feed</span>
+                </div>
+                <p className="text-[10px] text-white/50 mt-0.5">
+                  Over 100+ verified live English news, entertainment, and sports streams.
+                </p>
+              </div>
+              <button
+                onClick={() => handleFetchRemoteM3U("https://iptv-org.github.io/iptv/languages/eng.m3u")}
+                disabled={isFetchingUrl}
+                className="px-3 py-1.5 bg-[#0088FF] hover:bg-[#0077EE] text-white text-xs font-bold rounded-xl shrink-0 transition-all shadow-md shadow-[#0088FF]/20 cursor-pointer flex items-center gap-1.5 disabled:opacity-50"
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                <span>{isFetchingUrl ? "Ingesting..." : "Load Live EN Matrix"}</span>
+              </button>
+            </div>
+
+            {/* Direct URL Fetch */}
+            <div className="space-y-1.5">
+              <label className="text-xs text-white/40">Remote M3U / M3U8 Playlist URL</label>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  placeholder="https://example.com/playlist.m3u"
+                  value={remoteUrl}
+                  onChange={(e) => setRemoteUrl(e.target.value)}
+                  className="flex-1 bg-[#05070A] border border-white/10 text-xs rounded-xl px-3 py-2 text-white outline-none focus:border-[#0088FF]"
+                />
+                <button
+                  onClick={() => handleFetchRemoteM3U(remoteUrl)}
+                  disabled={isFetchingUrl || !remoteUrl.trim()}
+                  className="px-4 py-2 bg-[#0D121D] hover:bg-white/10 border border-white/10 text-xs font-bold text-white rounded-xl transition-all cursor-pointer disabled:opacity-40"
+                >
+                  Fetch URL
+                </button>
+              </div>
+            </div>
+
+            {/* Raw M3U Paste */}
             <div className="space-y-1">
-              <label className="text-xs font-mono text-white/40">Paste M3U / M3U8 Playlist Content</label>
+              <label className="text-xs text-white/40">Or Paste Raw M3U / M3U8 Content</label>
               <textarea
-                rows={6}
+                rows={4}
                 placeholder="#EXTM3U&#10;#EXTINF:-1 group-title=&quot;News&quot;,News Channel HD&#10;https://stream.url/live.m3u8"
                 value={m3uText}
                 onChange={(e) => setM3uText(e.target.value)}
-                className="w-full bg-[#05070A] border border-white/10 text-xs font-mono rounded-xl p-3 text-white outline-none focus:border-[#0088FF]"
+                className="w-full bg-[#05070A] border border-white/10 text-xs rounded-xl p-3 text-white outline-none focus:border-[#0088FF]"
               />
             </div>
+
+            {importStatus && (
+              <div className="p-2.5 bg-[#0088FF]/10 border border-[#0088FF]/30 rounded-xl text-xs text-[#0088FF] text-center">
+                {importStatus}
+              </div>
+            )}
+
             <button
               onClick={handleParseM3U}
-              className="w-full py-2.5 bg-[#0088FF] hover:bg-[#006CD0] text-white font-mono font-bold text-xs rounded-xl shadow-lg cursor-pointer"
+              className="w-full py-2.5 bg-[#0088FF] hover:bg-[#006CD0] text-white font-bold text-xs rounded-xl shadow-lg cursor-pointer"
             >
-              Parse &amp; Import Playlist Entries
+              Parse &amp; Import Text Entries
             </button>
           </div>
         )}

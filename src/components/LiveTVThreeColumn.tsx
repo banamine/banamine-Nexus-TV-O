@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from "react";
+import React, { useState, useRef } from "react";
 import { 
   Search, 
   Tv, 
@@ -21,6 +21,7 @@ import {
   Zap
 } from "lucide-react";
 import { Episode, WatchdogState } from "../types";
+import { HlsVideoPlayer } from "./HlsVideoPlayer";
 
 interface LiveTVThreeColumnProps {
   episodes: Episode[];
@@ -261,15 +262,21 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
             </div>
 
             {activeEp ? (
-              <video
-                ref={videoRef}
-                src={watchdogState.circuitEngaged ? watchdogState.activeFallbackUrl : activeEp.url}
-                controls={false}
-                autoPlay
-                loop
-                muted={isMuted}
-                className="w-full aspect-video object-cover"
-              />
+              <div className="w-full aspect-video">
+                <HlsVideoPlayer
+                  src={watchdogState.circuitEngaged ? watchdogState.activeFallbackUrl : activeEp.url}
+                  autoPlay={isPlaying}
+                  loop={true}
+                  muted={isMuted}
+                  controls={false}
+                  className="w-full aspect-video object-cover"
+                  onError={() => {
+                    if (!watchdogState.circuitEngaged) {
+                      onTriggerFailover();
+                    }
+                  }}
+                />
+              </div>
             ) : (
               <div className="aspect-video flex items-center justify-center text-white/40 text-xs font-mono">
                 No Channel Selected

@@ -12,6 +12,7 @@ import {
   Layers
 } from "lucide-react";
 import { Episode } from "../types";
+import { HlsVideoPlayer } from "./HlsVideoPlayer";
 
 interface MultiScreenGridProps {
   episodes: Episode[];
@@ -102,10 +103,10 @@ export const MultiScreenGrid: React.FC<MultiScreenGridProps> = ({ episodes }) =>
                 </div>
 
                 {ep ? (
-                  <video
+                  <HlsVideoPlayer
                     src={ep.url}
-                    autoPlay
-                    loop
+                    autoPlay={true}
+                    loop={true}
                     muted={!hasAudio}
                     controls={false}
                     className="w-full h-full object-cover"

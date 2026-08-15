@@ -20,6 +20,7 @@ import {
   Activity
 } from "lucide-react";
 import { Episode, PlayerPaddockState } from "../types";
+import { HlsVideoPlayer } from "./HlsVideoPlayer";
 
 interface ChannelPlayerViewProps {
   episodes: Episode[];
@@ -105,11 +106,10 @@ export const ChannelPlayerView: React.FC<ChannelPlayerViewProps> = ({
         </div>
 
         {activeEp ? (
-          <video
-            ref={videoRef}
+          <HlsVideoPlayer
             src={activeEp.url}
-            autoPlay
-            loop
+            autoPlay={isPlaying}
+            loop={true}
             muted={isMuted}
             controls={false}
             className="w-full h-full object-cover"
