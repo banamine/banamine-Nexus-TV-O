@@ -21,11 +21,23 @@ import {
   Zap,
   Layers,
   Database,
-  ListVideo
+  ListVideo,
+  History,
+  Trash2,
+  Filter,
+  X
 } from "lucide-react";
 import { Episode, WatchdogState } from "../types";
 import { HlsVideoPlayer } from "./HlsVideoPlayer";
 import { unwrapM3uOnDemand, getCachedPlaylistJSON } from "../utils/archiveHarvesterDB";
+import { 
+  getStoredFavorites, 
+  saveStoredFavorites, 
+  getStoredWatchHistory, 
+  recordWatchHistory, 
+  clearStoredWatchHistory,
+  WatchHistoryEntry
+} from "../utils/historyFavoritesStorage";
 
 interface LiveTVThreeColumnProps {
   episodes: Episode[];
@@ -50,10 +62,15 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
 }) => {
   const [selectedCategory, setSelectedCategory] = useState<string>("All");
   const [categoryFilter, setCategoryFilter] = useState<string>("");
+  const [channelSearch, setChannelSearch] = useState<string>("");
+  const [activeTypePill, setActiveTypePill] = useState<"all" | "news" | "movies" | "series" | "archive" | "favorites" | "history">("all");
   const [isPlaying, setIsPlaying] = useState<boolean>(true);
   const [isMuted, setIsMuted] = useState<boolean>(false);
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
-  const [favorites, setFavorites] = useState<Set<string>>(new Set(["ch-101", "ch-103"]));
+
+  // Persistent Favorites & Recent Watch History
+  const [favorites, setFavorites] = useState<Set<string>>(() => getStoredFavorites());
+  const [watchHistory, setWatchHistory] = useState<WatchHistoryEntry[]>(() => getStoredWatchHistory());
 
   // Unwrapped playlist state for multi-track M3Us / Archive items
   const [unwrappedTracks, setUnwrappedTracks] = useState<Episode[]>([]);
@@ -65,6 +82,14 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
   const videoRef = useRef<HTMLVideoElement>(null);
 
   const activeEp = selectedEpisode || episodes[0] || null;
+
+  // Record episode into persistent watch history on selection
+  useEffect(() => {
+    if (activeEp) {
+      const updated = recordWatchHistory(activeEp);
+      setWatchHistory(updated);
+    }
+  }, [activeEp?.id, activeEp?.url]);
 
   // Unpack M3U playlist lazily on channel switch
   useEffect(() => {
@@ -131,6 +156,7 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
   const categories: CategoryItem[] = [
     { id: "All", name: "All Channels", count: episodes.length, icon: Tv, restricted: false },
     { id: "Favorites", name: "Favorites ★", count: favorites.size, icon: Star, restricted: false },
+    { id: "History", name: "Recent History", count: watchHistory.length, icon: History, restricted: false },
     ...distinctGroups.map((grp: string): CategoryItem => {
       const isRestricted = grp.toLowerCase().includes("restricted");
       const isArchive = grp.toLowerCase().includes("archive") || grp.toLowerCase().includes("crime") || grp.toLowerCase().includes("highlights");
@@ -159,25 +185,77 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
     c.name.toLowerCase().includes(categoryFilter.toLowerCase())
   );
 
-  // Filter episodes by category
+  // Filter episodes by category, quick pill filter, and quick search term
   let displayedEpisodes = episodes.filter(ep => {
-    if (selectedCategory === "All") return true;
-    if (selectedCategory === "Favorites") return favorites.has(ep.id);
-    if (selectedCategory.includes("Restricted")) {
+    // Quick Category Pillar Filter
+    if (selectedCategory === "Favorites") {
+      if (!favorites.has(ep.id)) return false;
+    } else if (selectedCategory === "History") {
+      const historyIds = new Set(watchHistory.map(h => h.episode.id));
+      if (!historyIds.has(ep.id)) return false;
+    } else if (selectedCategory.includes("Restricted")) {
       if (!pinUnlocked) return false;
-      return (ep.groupTitle || "").includes("Restricted");
+      if (!(ep.groupTitle || "").includes("Restricted")) return false;
+    } else if (selectedCategory !== "All") {
+      if ((ep.groupTitle || "General") !== selectedCategory) return false;
     }
-    return (ep.groupTitle || "General") === selectedCategory;
+
+    // Quick Filter Pills
+    if (activeTypePill === "news") {
+      const isNews = ep.contentType === "news" || (ep.groupTitle || "").toLowerCase().includes("news");
+      if (!isNews) return false;
+    } else if (activeTypePill === "movies") {
+      const isMovie = ep.contentType === "movie" || (ep.groupTitle || "").toLowerCase().includes("movie") || (ep.groupTitle || "").toLowerCase().includes("cinema") || (ep.groupTitle || "").toLowerCase().includes("vod");
+      if (!isMovie) return false;
+    } else if (activeTypePill === "series") {
+      const isSeries = ep.contentType === "series" || (ep.groupTitle || "").toLowerCase().includes("series") || (ep.groupTitle || "").toLowerCase().includes("tv show");
+      if (!isSeries) return false;
+    } else if (activeTypePill === "archive") {
+      const isArchive = ep.sourceHost === "archive.org" || (ep.groupTitle || "").toLowerCase().includes("archive") || (ep.groupTitle || "").toLowerCase().includes("crime") || (ep.groupTitle || "").toLowerCase().includes("highlights");
+      if (!isArchive) return false;
+    } else if (activeTypePill === "favorites") {
+      if (!favorites.has(ep.id)) return false;
+    } else if (activeTypePill === "history") {
+      const historyIds = new Set(watchHistory.map(h => h.episode.id));
+      if (!historyIds.has(ep.id)) return false;
+    }
+
+    // Quick Channel Search Query
+    if (channelSearch.trim()) {
+      const q = channelSearch.toLowerCase();
+      const matchTitle = ep.title.toLowerCase().includes(q);
+      const matchGroup = (ep.groupTitle || "").toLowerCase().includes(q);
+      const matchTvg = (ep.tvgName || "").toLowerCase().includes(q);
+      if (!matchTitle && !matchGroup && !matchTvg) return false;
+    }
+
+    return true;
   });
+
+  // If History is selected, maintain chronological watch order
+  if (selectedCategory === "History" || activeTypePill === "history") {
+    const historyMap = new Map<string, number>(watchHistory.map((h, idx) => [h.episode.id, idx]));
+    displayedEpisodes = [...displayedEpisodes].sort((a, b) => {
+      const aIdx: number = historyMap.get(a.id) ?? 9999;
+      const bIdx: number = historyMap.get(b.id) ?? 9999;
+      return aIdx - bIdx;
+    });
+  }
 
   const toggleFavorite = (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
     setFavorites(prev => {
-      const next = new Set(prev);
+      const next = new Set<string>(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
+      saveStoredFavorites(next);
       return next;
     });
+  };
+
+  const handleClearHistory = () => {
+    clearStoredWatchHistory();
+    setWatchHistory([]);
   };
 
   const handleCategorySelect = (cat: CategoryItem) => {
@@ -238,7 +316,7 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
                 }`}
               >
                 <div className="flex items-center gap-2.5 truncate">
-                  <Icon className={`w-4 h-4 shrink-0 ${isSelected ? "text-white" : "text-[#0088FF]"}`} />
+                  <Icon className={`w-4 h-4 shrink-0 ${isSelected ? "text-white" : cat.id === "Favorites" ? "text-amber-400" : cat.id === "History" ? "text-cyan-400" : "text-[#0088FF]"}`} />
                   <span className="truncate">{cat.name}</span>
                 </div>
                 <div className="flex items-center gap-1">
@@ -257,26 +335,184 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
         </div>
       </div>
 
-      {/* COLUMN 2: CHANNEL INVENTORY PANEL (Middle) */}
-      <div id="column-2-inventory" className="column-2 w-full lg:w-80 bg-[#05070A] border-r border-white/10 flex flex-col h-1/3 lg:h-full shrink-0">
-        <div className="p-3 border-b border-white/10 flex items-center justify-between bg-[#0D121D]">
-          <span className="text-[11px] font-mono font-bold uppercase tracking-widest text-white/40">
-            {selectedCategory} ({displayedEpisodes.length})
-          </span>
-          <span className="text-[10px] font-mono text-[#00FF9D]">1080p / 4K</span>
+      {/* COLUMN 2: CHANNEL INVENTORY PANEL WITH FILTER PILLS & SEARCH (Middle) */}
+      <div id="column-2-inventory" className="column-2 w-full lg:w-96 bg-[#05070A] border-r border-white/10 flex flex-col h-1/3 lg:h-full shrink-0">
+        {/* Header with Title & Resolution */}
+        <div className="p-3 border-b border-white/10 bg-[#0D121D] space-y-2.5">
+          <div className="flex items-center justify-between">
+            <span className="text-[11px] font-mono font-bold uppercase tracking-widest text-white/70 flex items-center gap-1.5">
+              {selectedCategory === "Favorites" ? (
+                <Star className="w-3.5 h-3.5 text-amber-400 fill-amber-400" />
+              ) : selectedCategory === "History" ? (
+                <History className="w-3.5 h-3.5 text-cyan-400" />
+              ) : (
+                <Tv className="w-3.5 h-3.5 text-[#0088FF]" />
+              )}
+              <span>{selectedCategory}</span>
+              <span className="text-white/40 font-normal">({displayedEpisodes.length})</span>
+            </span>
+
+            <div className="flex items-center gap-1.5">
+              {selectedCategory === "History" && watchHistory.length > 0 && (
+                <button
+                  onClick={handleClearHistory}
+                  className="px-2 py-0.5 bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/30 rounded text-[10px] font-mono flex items-center gap-1 cursor-pointer transition-colors"
+                  title="Clear Recent History"
+                >
+                  <Trash2 className="w-3 h-3" />
+                  <span>Clear</span>
+                </button>
+              )}
+              <span className="text-[10px] font-mono text-[#00FF9D] bg-[#00FF9D]/10 px-1.5 py-0.5 rounded border border-[#00FF9D]/20">
+                1080p / 4K
+              </span>
+            </div>
+          </div>
+
+          {/* Quick Search Bar */}
+          <div className="relative">
+            <Search className="w-3.5 h-3.5 text-white/30 absolute left-2.5 top-1/2 -translate-y-1/2" />
+            <input
+              type="text"
+              placeholder="Quick search channels, movies, genres..."
+              value={channelSearch}
+              onChange={(e) => setChannelSearch(e.target.value)}
+              className="w-full bg-[#05070A] border border-white/10 text-xs rounded-xl pl-8 pr-7 py-1.5 text-white placeholder-white/30 outline-none focus:border-[#0088FF]"
+            />
+            {channelSearch && (
+              <button
+                onClick={() => setChannelSearch("")}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-white/30 hover:text-white cursor-pointer"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
+
+          {/* Category Filter Pills Directly Above Channel List */}
+          <div className="flex items-center gap-1 overflow-x-auto pb-0.5 scrollbar-none font-mono text-[10px]">
+            <button
+              onClick={() => setActiveTypePill("all")}
+              className={`px-2.5 py-1 rounded-lg font-bold transition-all cursor-pointer whitespace-nowrap ${
+                activeTypePill === "all"
+                  ? "bg-[#0088FF] text-white shadow-sm shadow-[#0088FF]/30"
+                  : "bg-[#05070A] text-white/50 hover:text-white border border-white/5 hover:border-white/20"
+              }`}
+            >
+              All ({episodes.length})
+            </button>
+            <button
+              onClick={() => setActiveTypePill("news")}
+              className={`px-2.5 py-1 rounded-lg font-bold transition-all cursor-pointer whitespace-nowrap flex items-center gap-1 ${
+                activeTypePill === "news"
+                  ? "bg-red-600 text-white shadow-sm shadow-red-600/30"
+                  : "bg-[#05070A] text-white/50 hover:text-white border border-white/5 hover:border-white/20"
+              }`}
+            >
+              <Radio className="w-2.5 h-2.5 text-red-400" />
+              <span>Live News</span>
+            </button>
+            <button
+              onClick={() => setActiveTypePill("movies")}
+              className={`px-2.5 py-1 rounded-lg font-bold transition-all cursor-pointer whitespace-nowrap flex items-center gap-1 ${
+                activeTypePill === "movies"
+                  ? "bg-purple-600 text-white shadow-sm shadow-purple-600/30"
+                  : "bg-[#05070A] text-white/50 hover:text-white border border-white/5 hover:border-white/20"
+              }`}
+            >
+              <Film className="w-2.5 h-2.5 text-purple-400" />
+              <span>VOD Movies</span>
+            </button>
+            <button
+              onClick={() => setActiveTypePill("series")}
+              className={`px-2.5 py-1 rounded-lg font-bold transition-all cursor-pointer whitespace-nowrap flex items-center gap-1 ${
+                activeTypePill === "series"
+                  ? "bg-emerald-600 text-white shadow-sm shadow-emerald-600/30"
+                  : "bg-[#05070A] text-white/50 hover:text-white border border-white/5 hover:border-white/20"
+              }`}
+            >
+              <Layers className="w-2.5 h-2.5 text-emerald-400" />
+              <span>TV Series</span>
+            </button>
+            <button
+              onClick={() => setActiveTypePill("archive")}
+              className={`px-2.5 py-1 rounded-lg font-bold transition-all cursor-pointer whitespace-nowrap flex items-center gap-1 ${
+                activeTypePill === "archive"
+                  ? "bg-amber-600 text-white shadow-sm shadow-amber-600/30"
+                  : "bg-[#05070A] text-white/50 hover:text-white border border-white/5 hover:border-white/20"
+              }`}
+            >
+              <Database className="w-2.5 h-2.5 text-amber-400" />
+              <span>Archive Classics</span>
+            </button>
+            <button
+              onClick={() => setActiveTypePill("favorites")}
+              className={`px-2.5 py-1 rounded-lg font-bold transition-all cursor-pointer whitespace-nowrap flex items-center gap-1 ${
+                activeTypePill === "favorites"
+                  ? "bg-amber-500 text-black font-extrabold shadow-sm shadow-amber-500/30"
+                  : "bg-[#05070A] text-amber-400/70 hover:text-amber-400 border border-white/5 hover:border-white/20"
+              }`}
+            >
+              <Star className="w-2.5 h-2.5 fill-current" />
+              <span>★ Favs ({favorites.size})</span>
+            </button>
+            <button
+              onClick={() => setActiveTypePill("history")}
+              className={`px-2.5 py-1 rounded-lg font-bold transition-all cursor-pointer whitespace-nowrap flex items-center gap-1 ${
+                activeTypePill === "history"
+                  ? "bg-cyan-600 text-white shadow-sm shadow-cyan-600/30"
+                  : "bg-[#05070A] text-cyan-400/70 hover:text-cyan-400 border border-white/5 hover:border-white/20"
+              }`}
+            >
+              <History className="w-2.5 h-2.5" />
+              <span>History ({watchHistory.length})</span>
+            </button>
+          </div>
         </div>
 
+        {/* Channel Cards Inventory List */}
         <div className="flex-1 overflow-y-auto p-2 space-y-1.5">
           {displayedEpisodes.length === 0 ? (
-            <div className="p-8 text-center space-y-2 text-white/40 font-mono">
-              <Lock className="w-8 h-8 text-amber-400 mx-auto" />
-              <p className="text-xs">Category Restricted or Empty.</p>
-              <button 
-                onClick={onOpenPinModal} 
-                className="px-3 py-1 bg-amber-500/20 text-amber-400 text-xs rounded border border-amber-500/40 cursor-pointer"
-              >
-                Unlock PIN Shield
-              </button>
+            <div className="p-8 text-center space-y-3 text-white/40 font-mono">
+              {selectedCategory.includes("Restricted") ? (
+                <>
+                  <Lock className="w-8 h-8 text-amber-400 mx-auto" />
+                  <p className="text-xs">Category Restricted.</p>
+                  <button 
+                    onClick={onOpenPinModal} 
+                    className="px-3 py-1 bg-amber-500/20 text-amber-400 text-xs rounded border border-amber-500/40 cursor-pointer"
+                  >
+                    Unlock PIN Shield
+                  </button>
+                </>
+              ) : activeTypePill === "favorites" || selectedCategory === "Favorites" ? (
+                <>
+                  <Star className="w-8 h-8 text-amber-400/50 mx-auto" />
+                  <p className="text-xs text-white/60 font-semibold">No favorited channels yet.</p>
+                  <p className="text-[11px] text-white/30">Click the ★ star icon on any channel card to bookmark it for instant access!</p>
+                </>
+              ) : activeTypePill === "history" || selectedCategory === "History" ? (
+                <>
+                  <History className="w-8 h-8 text-cyan-400/50 mx-auto" />
+                  <p className="text-xs text-white/60 font-semibold">Watch history is empty.</p>
+                  <p className="text-[11px] text-white/30">Channels and movies you play will automatically appear here.</p>
+                </>
+              ) : (
+                <>
+                  <Search className="w-8 h-8 text-white/20 mx-auto" />
+                  <p className="text-xs">No channels match filter &ldquo;{channelSearch}&rdquo;</p>
+                  <button
+                    onClick={() => {
+                      setChannelSearch("");
+                      setActiveTypePill("all");
+                      setSelectedCategory("All");
+                    }}
+                    className="px-3 py-1 bg-white/5 hover:bg-white/10 text-white/60 text-xs rounded border border-white/10 cursor-pointer"
+                  >
+                    Reset Filters
+                  </button>
+                </>
+              )}
             </div>
           ) : (
             displayedEpisodes.map((ep, idx) => {
@@ -307,7 +543,15 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
                       />
                     ) : (
                       <div className="w-9 h-9 rounded-lg bg-[#161E2E] flex items-center justify-center shrink-0 border border-white/10">
-                        <Tv className="w-4 h-4 text-[#0088FF]" />
+                        {ep.contentType === "news" ? (
+                          <Radio className="w-4 h-4 text-red-400" />
+                        ) : ep.contentType === "movie" ? (
+                          <Film className="w-4 h-4 text-purple-400" />
+                        ) : ep.contentType === "series" ? (
+                          <Layers className="w-4 h-4 text-emerald-400" />
+                        ) : (
+                          <Tv className="w-4 h-4 text-[#0088FF]" />
+                        )}
                       </div>
                     )}
 
@@ -323,8 +567,8 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
                         )}
                       </div>
                       <p className="text-[11px] text-white/50 truncate flex items-center gap-1.5 mt-0.5">
-                        <span className="text-[#0088FF] font-semibold">Now:</span>
-                        <span>{ep.description || "Continuous Live Broadcast"}</span>
+                        <span className="text-[#0088FF] font-semibold">{ep.groupTitle || "General"}</span>
+                        <span>• {ep.description || "Continuous Live Broadcast"}</span>
                       </p>
                     </div>
                   </div>
@@ -332,11 +576,14 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
                   <div className="flex items-center gap-1.5 shrink-0">
                     <button
                       onClick={(e) => toggleFavorite(ep.id, e)}
-                      className={`p-1 rounded transition-colors cursor-pointer ${
-                        isFav ? "text-amber-400 fill-amber-400" : "text-white/30 hover:text-white"
+                      title={isFav ? "Remove Favorite" : "Add to Favorites (★)"}
+                      className={`p-1.5 rounded-lg transition-all cursor-pointer ${
+                        isFav 
+                          ? "text-amber-400 bg-amber-400/10 hover:bg-amber-400/20" 
+                          : "text-white/30 hover:text-amber-400 hover:bg-white/5"
                       }`}
                     >
-                      <Star className="w-3.5 h-3.5" />
+                      <Star className={`w-3.5 h-3.5 ${isFav ? "fill-amber-400" : ""}`} />
                     </button>
                   </div>
                 </div>
@@ -354,8 +601,11 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
             ref={playerContainerRef} 
             className="relative bg-black rounded-2xl overflow-hidden border border-[#0088FF]/50 glow-blue shadow-2xl group crt-scanlines"
           >
-            <div className="osd-label">
-              PLAYER 1 // {activeEp?.groupTitle?.toUpperCase() || "TV NEWS PRIMARY"}
+            <div className="osd-label flex items-center gap-2">
+              <span>PLAYER 1 // {activeEp?.groupTitle?.toUpperCase() || "TV NEWS PRIMARY"}</span>
+              {activeEp && favorites.has(activeEp.id) && (
+                <span className="text-amber-400 text-[10px]">★ FAVORITED</span>
+              )}
             </div>
 
             {activeEp ? (
@@ -429,7 +679,20 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
                 </button>
 
                 <div>
-                  <h3 className="font-bold text-white text-sm truncate max-w-xs">{activeEp?.title}</h3>
+                  <div className="flex items-center gap-2">
+                    <h3 className="font-bold text-white text-sm truncate max-w-xs">{activeEp?.title}</h3>
+                    {activeEp && (
+                      <button
+                        onClick={(e) => toggleFavorite(activeEp.id, e)}
+                        className={`cursor-pointer transition-colors ${
+                          favorites.has(activeEp.id) ? "text-amber-400" : "text-white/40 hover:text-amber-400"
+                        }`}
+                        title="Bookmark Favorite"
+                      >
+                        <Star className={`w-3.5 h-3.5 ${favorites.has(activeEp.id) ? "fill-amber-400" : ""}`} />
+                      </button>
+                    )}
+                  </div>
                   <p className="text-[11px] text-white/50 font-mono">{activeEp?.groupTitle} • DECODING HLS STREAM 1080p60</p>
                 </div>
               </div>

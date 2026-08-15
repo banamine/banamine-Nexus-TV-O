@@ -101,6 +101,17 @@ export default function App() {
     setCurrentView("live");
   };
 
+  const handleSelectProgramChannel = (channelName: string) => {
+    const match = episodes.find(e => 
+      e.title.toLowerCase().includes(channelName.toLowerCase()) || 
+      channelName.toLowerCase().includes(e.title.toLowerCase())
+    );
+    if (match) {
+      handleSelectEpisode(match);
+      setCurrentView("live");
+    }
+  };
+
   // Filter episodes by global search term
   const filteredEpisodes = episodes.filter(e => 
     e.title.toLowerCase().includes(searchTerm.toLowerCase()) ||
@@ -194,6 +205,7 @@ export default function App() {
         isOpen={isEPGModalOpen}
         onClose={() => setIsEPGModalOpen(false)}
         epgGrid={epgGrid}
+        onSelectProgramChannel={handleSelectProgramChannel}
       />
     </div>
   );
