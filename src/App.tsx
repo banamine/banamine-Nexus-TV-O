@@ -37,7 +37,7 @@ export default function App() {
   // Watchdog Fallback State
   const [watchdogState, setWatchdogState] = useState<WatchdogState>({
     circuitEngaged: false,
-    activeFallbackUrl: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/TearsOfSteel.mp4",
+    activeFallbackUrl: "https://archive.org/download/Tears-of-Steel/tears_of_steel_720p.mp4",
     droppedStreamsCount: 0,
     statusMessage: "Watchdog Engine Nominal.",
     healthScore: 98,
@@ -52,9 +52,32 @@ export default function App() {
     }));
   };
 
+  const handleResetFailover = () => {
+    setWatchdogState(prev => ({
+      ...prev,
+      circuitEngaged: false,
+      statusMessage: "Watchdog Engine Nominal.",
+    }));
+  };
+
+  const handleSelectEpisode = (ep: Episode) => {
+    setSelectedEpisode(ep);
+    // Automatically disengage failover lock when user explicitly chooses a channel
+    setWatchdogState(prev => ({
+      ...prev,
+      circuitEngaged: false,
+      statusMessage: "Watchdog Engine Nominal.",
+    }));
+  };
+
   const handleImportEpisodes = (newEps: Episode[]) => {
     setEpisodes(prev => [...newEps, ...prev]);
     setStats(prev => ({ ...prev, totalChannels: prev.totalChannels + newEps.length }));
+  };
+
+  const handleUpdateEpisodes = (updated: Episode[]) => {
+    setEpisodes(updated);
+    setStats(prev => ({ ...prev, totalChannels: updated.length }));
   };
 
   const handlePlayVOD = (vod: VODItem) => {
@@ -70,6 +93,11 @@ export default function App() {
       contentType: vod.type === "movie" ? "movie" : "series",
     };
     setSelectedEpisode(vodEp);
+    setWatchdogState(prev => ({
+      ...prev,
+      circuitEngaged: false,
+      statusMessage: "Watchdog Engine Nominal.",
+    }));
     setCurrentView("live");
   };
 
@@ -110,11 +138,12 @@ export default function App() {
           <LiveTVThreeColumn
             episodes={filteredEpisodes}
             selectedEpisode={selectedEpisode}
-            onSelectEpisode={(ep) => setSelectedEpisode(ep)}
+            onSelectEpisode={handleSelectEpisode}
             pinUnlocked={pinUnlocked}
             onOpenPinModal={() => setIsPinModalOpen(true)}
             watchdogState={watchdogState}
             onTriggerFailover={handleTriggerFailover}
+            onResetFailover={handleResetFailover}
           />
         )}
 
@@ -153,6 +182,7 @@ export default function App() {
         onClose={() => setIsImportModalOpen(false)}
         episodes={episodes}
         onImportEpisodes={handleImportEpisodes}
+        onUpdateEpisodes={handleUpdateEpisodes}
       />
 
       <ThirdEyePanel

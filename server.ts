@@ -1,6 +1,7 @@
 import express from "express";
 import path from "path";
 import crypto from "crypto";
+import { Readable } from "stream";
 import { createServer as createViteServer } from "vite";
 
 const app = express();
@@ -31,12 +32,28 @@ interface ServerEpisode {
 
 let episodesStore: ServerEpisode[] = [
   {
-    id: "ch-101",
+    id: "ch-100",
     season: 1,
     episode: 1,
+    title: "The Fugitive - 1x01: Fear in a Desert City (Classic Series)",
+    duration: 3060,
+    url: "https://archive.org/download/The_Fugitive_Series/The%20Fugitive%20TV%20Series%20%281963-1967%29%20-%20Season%201/The%20Fugitive%20-%201x01%20-%20Fear%20in%20a%20Desert%20City.mp4",
+    status: "valid",
+    groupTitle: "Classics (Archive)",
+    tvgId: "fugitive.1x01.hd",
+    tvgName: "The Fugitive HD",
+    tvgLogo: "https://archive.org/services/img/The_Fugitive_Series",
+    sourceHost: "archive.org",
+    contentType: "series",
+    allowedPlayers: ["player1", "player2", "all"],
+  },
+  {
+    id: "ch-101",
+    season: 1,
+    episode: 2,
     title: "News 24 Global Morning - World Financial & Geopolitical Digest",
     duration: 3600,
-    url: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4",
+    url: "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
     status: "valid",
     groupTitle: "News",
     tvgId: "news24.global",
@@ -52,7 +69,7 @@ let episodesStore: ServerEpisode[] = [
     episode: 2,
     title: "Sports Network HD - Premier European Football Live Matchday",
     duration: 5400,
-    url: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4",
+    url: "https://archive.org/download/ElephantsDream/ed_1024_512kb.mp4",
     status: "valid",
     groupTitle: "Sports",
     tvgId: "sports.net.hd",
@@ -68,7 +85,7 @@ let episodesStore: ServerEpisode[] = [
     episode: 3,
     title: "Cinema Stream 4K - Sci-Fi Feature Presentation: Nebula Horizon",
     duration: 7200,
-    url: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
+    url: "https://archive.org/download/Tears-of-Steel/tears_of_steel_720p.mp4",
     status: "valid",
     groupTitle: "Movies",
     tvgId: "cinema.stream.4k",
@@ -83,7 +100,7 @@ let episodesStore: ServerEpisode[] = [
 // --- Watchdog Circuit Breaker Engine ---
 let watchdogState = {
   circuitEngaged: false,
-  activeFallbackUrl: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/TearsOfSteel.mp4",
+  activeFallbackUrl: "https://archive.org/download/Tears-of-Steel/tears_of_steel_720p.mp4",
   droppedStreamsCount: 0,
   statusMessage: "Watchdog Engine Nominal. Monitoring 24/7 stream feeds.",
   lastFailoverAt: undefined as string | undefined,
@@ -266,31 +283,126 @@ app.post("/api/episodes/auto-tag", (_req, res) => {
   res.json({ success: true, taggedCount });
 });
 
-// --- CORS PROXY FOR MULTI-SCREEN & HLS ---
+// --- HIGH PERFORMANCE STREAMING CORS PROXY WITH RANGE SUPPORT ---
 app.get("/api/proxy", async (req, res) => {
   const targetUrl = req.query.url as string;
   if (!targetUrl) return res.status(400).send("Missing url parameter");
 
-  try {
-    const response = await fetch(targetUrl, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) IPTV Smarters Pro Matrix Agent",
-      },
-    });
+  // Generate URL candidates, especially for Archive.org streams where /cors/ prevents broken 302 redirects to regional nodes
+  const candidates: string[] = [];
+  const trimmed = targetUrl.trim();
 
-    if (!response.ok) {
-      return res.status(response.status).send(`Upstream returned ${response.status}`);
+  if (trimmed.includes("archive.org/download/")) {
+    candidates.push(trimmed.replace("archive.org/download/", "archive.org/cors/"));
+    candidates.push(trimmed.replace("archive.org/download/", "archive.org/serve/"));
+  }
+  candidates.push(trimmed);
+
+  const controller = new AbortController();
+  const abortTimeout = setTimeout(() => controller.abort(), 25000); // 25s upstream connect timeout
+
+  req.on("close", () => {
+    clearTimeout(abortTimeout);
+    controller.abort();
+  });
+
+  const upstreamHeaders: Record<string, string> = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    "Accept-Encoding": "identity",
+  };
+
+  if (req.headers.range) {
+    upstreamHeaders["Range"] = req.headers.range;
+  }
+
+  let finalResponse: Response | null = null;
+  let lastError: any = null;
+
+  for (const cand of candidates) {
+    let cleanCand = cand;
+    try {
+      cleanCand = decodeURI(cleanCand);
+    } catch {
+      // keep
     }
+    cleanCand = encodeURI(cleanCand).replace(/#/g, "%23");
 
-    const contentType = response.headers.get("content-type") || "video/mp4";
+    try {
+      const response = await fetch(cleanCand, {
+        headers: upstreamHeaders,
+        redirect: "follow",
+        signal: controller.signal,
+      });
+
+      if (response.ok || response.status === 206) {
+        finalResponse = response;
+        break;
+      }
+    } catch (err: any) {
+      lastError = err;
+      if (err.name === "AbortError") break;
+    }
+  }
+
+  clearTimeout(abortTimeout);
+
+  if (!finalResponse) {
+    if (req.destroyed || lastError?.name === "AbortError") return;
+    return res.status(502).send("Proxy could not fetch upstream stream: " + (lastError?.message || "Upstream unavailable"));
+  }
+
+  try {
+    // Set streaming & media headers
+    res.status(finalResponse.status);
+    const contentType = finalResponse.headers.get("content-type") || "video/mp4";
+    const contentLength = finalResponse.headers.get("content-length");
+    const contentRange = finalResponse.headers.get("content-range");
+    const acceptRanges = finalResponse.headers.get("accept-ranges") || "bytes";
+
     res.setHeader("Content-Type", contentType);
     res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Headers", "*");
+    res.setHeader("Accept-Ranges", acceptRanges);
 
-    const arrayBuffer = await response.arrayBuffer();
-    res.send(Buffer.from(arrayBuffer));
+    if (contentLength) res.setHeader("Content-Length", contentLength);
+    if (contentRange) res.setHeader("Content-Range", contentRange);
+
+    if (finalResponse.body) {
+      const nodeStream = Readable.fromWeb(finalResponse.body as any);
+      nodeStream.on("error", () => {
+        // Stream aborted by client or upstream
+      });
+      nodeStream.pipe(res);
+    } else {
+      res.end();
+    }
   } catch (err: any) {
-    console.error("[Proxy Error]:", err.message);
-    res.status(500).send("Proxy fetch failed: " + err.message);
+    if (err.name === "AbortError" || req.destroyed) return;
+    console.warn("[Proxy Pipe Warning]:", err.message || err);
+    if (!res.headersSent) {
+      res.status(502).send("Proxy streaming pipe failed");
+    }
+  }
+});
+
+// --- SERVER-SIDE ARCHIVE.ORG HARVESTER ---
+app.get("/api/archive/metadata", async (req, res) => {
+  const identifier = (req.query.id as string || "").trim();
+  if (!identifier) return res.status(400).json({ error: "Missing id parameter" });
+
+  try {
+    const archiveUrl = `https://archive.org/metadata/${identifier}`;
+    const response = await fetch(archiveUrl, {
+      headers: { "User-Agent": "Mozilla/5.0 IPTV Archive Harvester" },
+    });
+    if (!response.ok) {
+      return res.status(response.status).json({ error: `Archive metadata error: ${response.status}` });
+    }
+    const data = await response.json();
+    res.json(data);
+  } catch (err: any) {
+    res.status(500).json({ error: "Archive metadata fetch failed: " + err.message });
   }
 });
 

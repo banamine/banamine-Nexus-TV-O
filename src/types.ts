@@ -22,6 +22,10 @@ export interface Episode {
   contentType?: ContentType | null;
   allowedPlayers?: PlayerTarget[];
   importedAt?: string;
+  isLazy?: boolean;
+  m3uSourceUrl?: string;
+  unwrappedEpisodes?: Episode[];
+  isUnwrapping?: boolean;
 }
 
 export interface VODItem {

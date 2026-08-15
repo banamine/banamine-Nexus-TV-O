@@ -137,7 +137,20 @@
   border: 1px solid rgba(255, 255, 255, 0.05);
 }
 
-::-webkit-scrollbar-thumb:hover {
-  background: #0088FF;
+/* Episode & Channel Selection Styling Utilities */
+.badge-active,
+.active-indicator {
+  border-color: #0088FF !important;
+  background-color: rgba(0, 136, 255, 0.18) !important;
+  box-shadow: 0 0 15px rgba(0, 136, 255, 0.3) !important;
+}
+
+.episode-button:focus-visible,
+.episode-button:hover {
+  border-color: rgba(0, 136, 255, 0.5);
+}
+
+.stream-toolbar {
+  border: 1px solid rgba(255, 255, 255, 0.08);
 }
 

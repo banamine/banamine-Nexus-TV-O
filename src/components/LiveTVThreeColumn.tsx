@@ -1,4 +1,4 @@
-import React, { useState, useRef } from "react";
+import React, { useState, useRef, useEffect } from "react";
 import { 
   Search, 
   Tv, 
@@ -18,10 +18,14 @@ import {
   CheckCircle2,
   RefreshCw,
   Film,
-  Zap
+  Zap,
+  Layers,
+  Database,
+  ListVideo
 } from "lucide-react";
 import { Episode, WatchdogState } from "../types";
 import { HlsVideoPlayer } from "./HlsVideoPlayer";
+import { unwrapM3uOnDemand, getCachedPlaylistJSON } from "../utils/archiveHarvesterDB";
 
 interface LiveTVThreeColumnProps {
   episodes: Episode[];
@@ -31,6 +35,7 @@ interface LiveTVThreeColumnProps {
   onOpenPinModal: () => void;
   watchdogState: WatchdogState;
   onTriggerFailover: () => void;
+  onResetFailover?: () => void;
 }
 
 export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
@@ -41,6 +46,7 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
   onOpenPinModal,
   watchdogState,
   onTriggerFailover,
+  onResetFailover,
 }) => {
   const [selectedCategory, setSelectedCategory] = useState<string>("All");
   const [categoryFilter, setCategoryFilter] = useState<string>("");
@@ -49,19 +55,104 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
   const [favorites, setFavorites] = useState<Set<string>>(new Set(["ch-101", "ch-103"]));
 
+  // Unwrapped playlist state for multi-track M3Us / Archive items
+  const [unwrappedTracks, setUnwrappedTracks] = useState<Episode[]>([]);
+  const [activeTrackIndex, setActiveTrackIndex] = useState<number>(0);
+  const [isUnwrapping, setIsUnwrapping] = useState<boolean>(false);
+  const [isServedFromDBCache, setIsServedFromDBCache] = useState<boolean>(false);
+
   const playerContainerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
 
-  // Group list categories
-  const categories = [
-    { id: "All", name: "All Channels", count: episodes.length, icon: Tv },
-    { id: "Favorites", name: "Favorites ★", count: favorites.size, icon: Star },
-    { id: "News", name: "News Network", count: episodes.filter(e => e.groupTitle === "News").length, icon: Radio },
-    { id: "Sports", name: "Sports HD", count: episodes.filter(e => e.groupTitle === "Sports").length, icon: Zap },
-    { id: "Movies", name: "Movies & Cinema", count: episodes.filter(e => e.groupTitle === "Movies").length, icon: Film },
-    { id: "Kids", name: "Kids Zone", count: episodes.filter(e => e.groupTitle === "Kids").length, icon: Sparkles },
-    { id: "Documentaries", name: "Documentaries", count: episodes.filter(e => e.groupTitle === "Documentaries").length, icon: Clock },
-    { id: "Restricted 🔒", name: "Restricted Vault", count: episodes.filter(e => e.groupTitle.includes("Restricted")).length, icon: Lock, restricted: true },
+  const activeEp = selectedEpisode || episodes[0] || null;
+
+  // Unpack M3U playlist lazily on channel switch
+  useEffect(() => {
+    if (!activeEp) {
+      setUnwrappedTracks([]);
+      return;
+    }
+
+    const m3uUrl = activeEp.m3uSourceUrl || activeEp.url || "";
+    const isM3u =
+      ((m3uUrl.toLowerCase().endsWith(".m3u") || m3uUrl.toLowerCase().includes(".m3u?")) &&
+        !m3uUrl.toLowerCase().includes(".m3u8")) ||
+      Boolean(activeEp.isLazy);
+
+    if (isM3u) {
+      setIsUnwrapping(true);
+      const cached = getCachedPlaylistJSON(m3uUrl);
+      if (cached && cached.length > 0) {
+        setUnwrappedTracks(cached);
+        setActiveTrackIndex(0);
+        setIsServedFromDBCache(true);
+        setIsUnwrapping(false);
+      } else {
+        setIsServedFromDBCache(false);
+        unwrapM3uOnDemand(activeEp).then((res) => {
+          setUnwrappedTracks(res.episodes);
+          setActiveTrackIndex(0);
+          setIsServedFromDBCache(res.fromCache);
+          setIsUnwrapping(false);
+        }).catch((err) => {
+          console.warn("Unwrap error:", err);
+          setUnwrappedTracks([activeEp]);
+          setIsUnwrapping(false);
+        });
+      }
+    } else {
+      setUnwrappedTracks([activeEp]);
+      setActiveTrackIndex(0);
+      setIsServedFromDBCache(false);
+      setIsUnwrapping(false);
+    }
+  }, [activeEp?.id, activeEp?.url]);
+
+  // Determine current active stream URL
+  const currentStreamUrl = (() => {
+    if (watchdogState.circuitEngaged) return watchdogState.activeFallbackUrl;
+    if (unwrappedTracks.length > 0 && unwrappedTracks[activeTrackIndex]) {
+      return unwrappedTracks[activeTrackIndex].url;
+    }
+    return activeEp?.url || "";
+  })();
+
+  // Dynamically derive all category buckets from existing episodes
+  const distinctGroups: string[] = Array.from(new Set(episodes.map(e => e.groupTitle || "General")));
+
+  interface CategoryItem {
+    id: string;
+    name: string;
+    count: number;
+    icon: React.ComponentType<{ className?: string }>;
+    restricted: boolean;
+  }
+
+  const categories: CategoryItem[] = [
+    { id: "All", name: "All Channels", count: episodes.length, icon: Tv, restricted: false },
+    { id: "Favorites", name: "Favorites ★", count: favorites.size, icon: Star, restricted: false },
+    ...distinctGroups.map((grp: string): CategoryItem => {
+      const isRestricted = grp.toLowerCase().includes("restricted");
+      const isArchive = grp.toLowerCase().includes("archive") || grp.toLowerCase().includes("crime") || grp.toLowerCase().includes("highlights");
+      const isSports = grp.toLowerCase().includes("sport");
+      const isNews = grp.toLowerCase().includes("news");
+      const isMovies = grp.toLowerCase().includes("movie") || grp.toLowerCase().includes("series");
+
+      let icon: React.ComponentType<{ className?: string }> = Tv;
+      if (isArchive) icon = Film;
+      else if (isSports) icon = Zap;
+      else if (isNews) icon = Radio;
+      else if (isMovies) icon = Layers;
+      else if (isRestricted) icon = Lock;
+
+      return {
+        id: grp,
+        name: grp,
+        count: episodes.filter(e => (e.groupTitle || "General") === grp).length,
+        icon,
+        restricted: isRestricted,
+      };
+    }),
   ];
 
   const filteredCategories = categories.filter(c => 
@@ -72,11 +163,11 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
   let displayedEpisodes = episodes.filter(ep => {
     if (selectedCategory === "All") return true;
     if (selectedCategory === "Favorites") return favorites.has(ep.id);
-    if (selectedCategory === "Restricted 🔒") {
+    if (selectedCategory.includes("Restricted")) {
       if (!pinUnlocked) return false;
-      return ep.groupTitle.includes("Restricted");
+      return (ep.groupTitle || "").includes("Restricted");
     }
-    return ep.groupTitle.toLowerCase().includes(selectedCategory.toLowerCase());
+    return (ep.groupTitle || "General") === selectedCategory;
   });
 
   const toggleFavorite = (id: string, e: React.MouseEvent) => {
@@ -89,9 +180,7 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
     });
   };
 
-  const activeEp = selectedEpisode || episodes[0] || null;
-
-  const handleCategorySelect = (cat: typeof categories[0]) => {
+  const handleCategorySelect = (cat: CategoryItem) => {
     if (cat.restricted && !pinUnlocked) {
       onOpenPinModal();
       return;
@@ -169,7 +258,7 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
       </div>
 
       {/* COLUMN 2: CHANNEL INVENTORY PANEL (Middle) */}
-      <div className="w-full lg:w-80 bg-[#05070A] border-r border-white/10 flex flex-col h-1/3 lg:h-full shrink-0">
+      <div id="column-2-inventory" className="column-2 w-full lg:w-80 bg-[#05070A] border-r border-white/10 flex flex-col h-1/3 lg:h-full shrink-0">
         <div className="p-3 border-b border-white/10 flex items-center justify-between bg-[#0D121D]">
           <span className="text-[11px] font-mono font-bold uppercase tracking-widest text-white/40">
             {selectedCategory} ({displayedEpisodes.length})
@@ -197,10 +286,11 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
               return (
                 <div
                   key={ep.id}
+                  id={`channel-item-${ep.id}`}
                   onClick={() => onSelectEpisode(ep)}
-                  className={`p-3 rounded-xl border transition-all cursor-pointer flex items-center justify-between gap-3 ${
+                  className={`channel-card p-3 rounded-xl border transition-all cursor-pointer flex items-center justify-between gap-3 ${
                     isSelected
-                      ? "bg-[#0D121D] border-[#0088FF] glow-blue"
+                      ? "badge-active active-indicator bg-[#0D121D] border-[#0088FF] glow-blue"
                       : "bg-[#0D121D]/60 border-white/5 hover:bg-[#0D121D] hover:border-white/20"
                   }`}
                 >
@@ -222,9 +312,16 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
                     )}
 
                     <div className="min-w-0">
-                      <h4 className="text-xs font-bold text-white truncate group-hover:text-[#0088FF]">
-                        {ep.title}
-                      </h4>
+                      <div className="flex items-center gap-1.5 truncate">
+                        <h4 className="text-xs font-bold text-white truncate group-hover:text-[#0088FF]">
+                          {ep.title}
+                        </h4>
+                        {ep.isLazy && (
+                          <span className="text-[9px] font-mono px-1 py-0.2 bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 rounded shrink-0">
+                            LAZY DB
+                          </span>
+                        )}
+                      </div>
                       <p className="text-[11px] text-white/50 truncate flex items-center gap-1.5 mt-0.5">
                         <span className="text-[#0088FF] font-semibold">Now:</span>
                         <span>{ep.description || "Continuous Live Broadcast"}</span>
@@ -250,7 +347,7 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
       </div>
 
       {/* COLUMN 3: LIVE PREVIEW & EPG WORKSPACE (Right) */}
-      <div className="flex-1 bg-[#05070A] flex flex-col h-1/3 lg:h-full overflow-y-auto">
+      <div id="column-3-workspace" className="column-3 flex-1 bg-[#05070A] flex flex-col h-1/3 lg:h-full overflow-y-auto">
         <div className="p-4 space-y-4 max-w-5xl mx-auto w-full">
           {/* VIDEO PLAYER CONTAINER */}
           <div 
@@ -262,9 +359,9 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
             </div>
 
             {activeEp ? (
-              <div className="w-full aspect-video">
+              <div className="w-full aspect-video relative">
                 <HlsVideoPlayer
-                  src={watchdogState.circuitEngaged ? watchdogState.activeFallbackUrl : activeEp.url}
+                  src={currentStreamUrl}
                   autoPlay={isPlaying}
                   loop={true}
                   muted={isMuted}
@@ -276,6 +373,15 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
                     }
                   }}
                 />
+
+                {/* Lazy Unwrapping Spinner / Notice */}
+                {isUnwrapping && (
+                  <div className="absolute inset-0 bg-black/70 backdrop-blur-sm flex flex-col items-center justify-center gap-2 z-30 font-mono">
+                    <RefreshCw className="w-6 h-6 text-[#0088FF] animate-spin" />
+                    <span className="text-xs font-bold text-white">Unwrapping M3U Playlist into JSON DB...</span>
+                    <span className="text-[10px] text-white/50">archive.org &rarr; local channel DB</span>
+                  </div>
+                )}
               </div>
             ) : (
               <div className="aspect-video flex items-center justify-center text-white/40 text-xs font-mono">
@@ -330,6 +436,12 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
 
               {/* STREAM QUALITY BADGES */}
               <div className="flex items-center gap-2 font-mono text-[10px]">
+                {isServedFromDBCache && (
+                  <span className="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 flex items-center gap-1">
+                    <Database className="w-3 h-3" />
+                    <span>DB CACHED</span>
+                  </span>
+                )}
                 <span className="px-2 py-0.5 rounded bg-[#00FF9D]/20 text-[#00FF9D] border border-[#00FF9D]/30">4K UHD</span>
                 <span className="px-2 py-0.5 rounded bg-purple-500/20 text-purple-400 border border-purple-500/30">AAC 5.1</span>
                 <span className="px-2 py-0.5 rounded bg-blue-500/20 text-blue-400 border border-blue-500/30">60 FPS</span>
@@ -345,8 +457,57 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
             </div>
           </div>
 
+          {/* UNWRAPPED ARCHIVE PLAYLIST TRACKS / MULTI-EPISODES SELECTOR */}
+          {unwrappedTracks.length > 1 && (
+            <div className="glass-card p-4 space-y-3 border-l-4 border-l-[#0088FF]">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <ListVideo className="w-4 h-4 text-[#0088FF]" />
+                  <h3 className="text-xs font-mono font-bold text-white uppercase tracking-wider">
+                    Unwrapped Playlist Episodes ({unwrappedTracks.length} Tracks In DB)
+                  </h3>
+                </div>
+                <span className="text-[10px] font-mono text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20 flex items-center gap-1">
+                  <Database className="w-3 h-3" />
+                  <span>On-Demand JSON Stream</span>
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-48 overflow-y-auto pr-1">
+                {unwrappedTracks.map((trk, tIdx) => {
+                  const isTrackActive = activeTrackIndex === tIdx;
+                  return (
+                    <button
+                      key={trk.id || tIdx}
+                      id={`episode-btn-${trk.id || tIdx}`}
+                      onClick={() => {
+                        setActiveTrackIndex(tIdx);
+                        if (onResetFailover) onResetFailover();
+                      }}
+                      className={`episode-button p-2.5 rounded-xl border text-left flex items-center justify-between gap-2 text-xs font-mono transition-all cursor-pointer ${
+                        isTrackActive
+                          ? "badge-active active-indicator bg-[#0088FF]/20 border-[#0088FF] text-white shadow-md shadow-[#0088FF]/20 font-bold"
+                          : "bg-[#05070A] border-white/5 text-white/70 hover:border-white/20 hover:text-white"
+                      }`}
+                    >
+                      <div className="flex items-center gap-2 truncate">
+                        <span className={`w-5 h-5 rounded flex items-center justify-center text-[10px] shrink-0 font-bold ${
+                          isTrackActive ? "bg-[#0088FF] text-white" : "bg-white/10 text-white/40"
+                        }`}>
+                          {tIdx + 1}
+                        </span>
+                        <span className="truncate">{trk.title}</span>
+                      </div>
+                      {isTrackActive && <Play className="w-3.5 h-3.5 text-[#00FF9D] shrink-0 fill-[#00FF9D]" />}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           {/* TIMELINE PROGRESS & WATCHDOG FAILOVER TOOLBAR */}
-          <div className="glass-card p-4 space-y-3">
+          <div id="stream-toolbar" className="stream-toolbar glass-card p-4 space-y-3">
             <div className="flex items-center justify-between text-xs font-mono text-white/40">
               <span>00:14:20</span>
               <div className="flex-1 mx-4 h-1.5 bg-black/60 rounded-full overflow-hidden relative border border-white/5">
@@ -363,13 +524,23 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
               </div>
 
               <div className="flex items-center gap-2">
-                <button
-                  onClick={onTriggerFailover}
-                  className="px-3 py-1.5 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/30 rounded-xl text-xs font-mono font-bold flex items-center gap-1.5 transition-all cursor-pointer"
-                >
-                  <RefreshCw className="w-3.5 h-3.5" />
-                  <span>Test Watchdog Fallback</span>
-                </button>
+                {watchdogState.circuitEngaged ? (
+                  <button
+                    onClick={onResetFailover}
+                    className="reset-toggle px-3 py-1.5 bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-400 border border-emerald-500/40 rounded-xl text-xs font-mono font-bold flex items-center gap-1.5 transition-all cursor-pointer"
+                  >
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    <span>Reset to Live Channel Feed</span>
+                  </button>
+                ) : (
+                  <button
+                    onClick={onTriggerFailover}
+                    className="reset-toggle px-3 py-1.5 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/30 rounded-xl text-xs font-mono font-bold flex items-center gap-1.5 transition-all cursor-pointer"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>Test Watchdog Fallback</span>
+                  </button>
+                )}
               </div>
             </div>
           </div>
