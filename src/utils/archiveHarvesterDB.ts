@@ -80,36 +80,35 @@ export function cleanTitleFromFilename(filename: string): string {
 }
 
 // 4. Archive.org Direct File Normalization
-// Resolves /details/ URLs to raw /download/ or /cors/ paths to avoid HTML container redirects during HTML5 media playback
-export function normalizeStreamUrl(url: string, preferCorsEndpoint: boolean = true): string {
+// Strict Permalink Routing: routes all Archive.org media directly to https://archive.org/download/IDENTIFIER/FILE
+// Zero-Alteration Encoding: preserves exact raw FILE string without decodeURI or re-encoding.
+export function normalizeStreamUrl(url: string, _preferCorsEndpoint: boolean = false): string {
   if (!url) return "";
-  let clean = url.trim();
+  const trimmed = url.trim();
 
-  // Convert direct /details/{id}/{filename} to /download/{id}/{filename}
-  const detailsFileMatch = clean.match(/archive\.org\/details\/([^/?#]+)\/([^?#]+)/i);
-  if (detailsFileMatch) {
-    const id = detailsFileMatch[1];
-    const file = detailsFileMatch[2];
-    clean = `https://archive.org/download/${id}/${file}`;
-  } else {
-    // Convert /details/{id} to /download/{id}
-    const detailsMatch = clean.match(/archive\.org\/details\/([^/?#]+)(?:\/)?$/i);
-    if (detailsMatch) {
-      clean = `https://archive.org/download/${detailsMatch[1]}`;
-    }
+  // Pattern 1: standard archive.org/(download|details|embed|cors|metadata)/IDENTIFIER/FILE...
+  const stdMatch = trimmed.match(/^https?:\/\/(?:www\.)?archive\.org\/(?:download|details|embed|cors|metadata)\/([^/?#]+)\/(.+)$/i);
+  if (stdMatch) {
+    const identifier = stdMatch[1];
+    const rawFilePath = stdMatch[2]; // Preserved verbatim
+    return `https://archive.org/download/${identifier}/${rawFilePath}`;
   }
 
-  // Convert /download/ to /cors/ if CORS-enabled direct playback is desired
-  if (preferCorsEndpoint && clean.includes("archive.org/download/")) {
-    clean = clean.replace("archive.org/download/", "archive.org/cors/");
+  // Pattern 2: archive cluster direct items e.g. ia800...us.archive.org/(\d+/)?items/IDENTIFIER/FILE...
+  const clusterMatch = trimmed.match(/^https?:\/\/[a-z0-9_.-]*archive\.org\/(?:\d+\/)?items\/([^/?#]+)\/(.+)$/i);
+  if (clusterMatch) {
+    const identifier = clusterMatch[1];
+    const rawFilePath = clusterMatch[2];
+    return `https://archive.org/download/${identifier}/${rawFilePath}`;
   }
 
-  try {
-    clean = decodeURI(clean);
-  } catch {
-    // ignore
+  // Pattern 3: item root link
+  const itemMatch = trimmed.match(/^https?:\/\/(?:www\.)?archive\.org\/(?:download|details|embed|cors|metadata)\/([^/?#]+)(?:\/)?$/i);
+  if (itemMatch) {
+    return `https://archive.org/download/${itemMatch[1]}`;
   }
-  return encodeURI(clean).replace(/#/g, "%23");
+
+  return trimmed;
 }
 
 // 5. CORS Proxy URL generator for static GitHub Pages / strict CORS boundaries

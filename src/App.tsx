@@ -22,7 +22,16 @@ import { Episode, VODItem, WatchdogState } from "./types";
 export default function App() {
   const [currentView, setCurrentView] = useState<string>("home");
   const [searchTerm, setSearchTerm] = useState<string>("");
-  const [episodes, setEpisodes] = useState<Episode[]>(INITIAL_EPISODES);
+  const [episodes, setEpisodes] = useState<Episode[]>(() => {
+    const saved = localStorage.getItem("nexus_uploaded_m3u_episodes");
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      } catch {}
+    }
+    return INITIAL_EPISODES;
+  });
   const [selectedEpisode, setSelectedEpisode] = useState<Episode | null>(INITIAL_EPISODES[0] || null);
   const [vodCatalog] = useState<VODItem[]>(INITIAL_VOD_CATALOG);
   const [epgGrid] = useState(INITIAL_EPG_GRID);
@@ -38,10 +47,10 @@ export default function App() {
   // Watchdog Fallback State
   const [watchdogState, setWatchdogState] = useState<WatchdogState>({
     circuitEngaged: false,
-    activeFallbackUrl: "https://archive.org/download/Tears-of-Steel/tears_of_steel_720p.mp4",
+    activeFallbackUrl: "",
     droppedStreamsCount: 0,
     statusMessage: "Watchdog Engine Nominal.",
-    healthScore: 98,
+    healthScore: 100,
   });
 
   const handleTriggerFailover = () => {
@@ -49,7 +58,7 @@ export default function App() {
       ...prev,
       circuitEngaged: true,
       droppedStreamsCount: prev.droppedStreamsCount + 1,
-      statusMessage: "ENGAGING FALLBACK STREAM... Swapped manifest automatically.",
+      statusMessage: "Watchdog Alert: Stream synchronization flagged.",
     }));
   };
 
@@ -63,7 +72,6 @@ export default function App() {
 
   const handleSelectEpisode = (ep: Episode) => {
     setSelectedEpisode(ep);
-    // Automatically disengage failover lock when user explicitly chooses a channel
     setWatchdogState(prev => ({
       ...prev,
       circuitEngaged: false,
@@ -72,12 +80,21 @@ export default function App() {
   };
 
   const handleImportEpisodes = (newEps: Episode[]) => {
-    setEpisodes(prev => [...newEps, ...prev]);
+    setEpisodes(prev => {
+      const combined = [...newEps, ...prev];
+      try {
+        localStorage.setItem("nexus_uploaded_m3u_episodes", JSON.stringify(combined));
+      } catch {}
+      return combined;
+    });
     setStats(prev => ({ ...prev, totalChannels: prev.totalChannels + newEps.length }));
   };
 
   const handleUpdateEpisodes = (updated: Episode[]) => {
     setEpisodes(updated);
+    try {
+      localStorage.setItem("nexus_uploaded_m3u_episodes", JSON.stringify(updated));
+    } catch {}
     setStats(prev => ({ ...prev, totalChannels: updated.length }));
   };
 
@@ -173,6 +190,7 @@ export default function App() {
               onSelectChannel={(ep) => {
                 setSelectedEpisode(ep);
               }}
+              onImportEpisodes={handleImportEpisodes}
             />
           </div>
         )}

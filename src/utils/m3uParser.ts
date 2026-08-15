@@ -5,6 +5,7 @@ export interface M3UParseOptions {
   fallbackPoster?: string;
   channelId?: string;
   channelName?: string;
+  sourceFilename?: string;
 }
 
 export interface ParsedShowManifest {
@@ -12,17 +13,80 @@ export interface ParsedShowManifest {
   channelId: string;
   totalDurationSec: number;
   episodes: Episode[];
+  sourceFilename?: string;
+}
+
+/**
+ * Strict Permalink Routing:
+ * Ensures all Archive.org media is routed exclusively through the permalink structure:
+ * https://archive.org/download/IDENTIFIER/FILE
+ * 
+ * Zero-Alteration Encoding:
+ * Preserves the exact raw text string of FILE without decodeURI or re-encoding.
+ */
+export function formatArchivePermalink(rawUrl: string): string {
+  if (!rawUrl) return "";
+  const trimmed = rawUrl.trim();
+
+  // Pattern 1: standard archive.org/(download|details|embed|cors|metadata)/IDENTIFIER/FILE...
+  const stdMatch = trimmed.match(/^https?:\/\/(?:www\.)?archive\.org\/(?:download|details|embed|cors|metadata)\/([^/?#]+)\/(.+)$/i);
+  if (stdMatch) {
+    const identifier = stdMatch[1];
+    const rawFilePath = stdMatch[2]; // Preserved EXACTLY as written in the source line
+    return `https://archive.org/download/${identifier}/${rawFilePath}`;
+  }
+
+  // Pattern 2: archive cluster direct items e.g. ia800...us.archive.org/(\d+/)?items/IDENTIFIER/FILE...
+  const clusterMatch = trimmed.match(/^https?:\/\/[a-z0-9_.-]*archive\.org\/(?:\d+\/)?items\/([^/?#]+)\/(.+)$/i);
+  if (clusterMatch) {
+    const identifier = clusterMatch[1];
+    const rawFilePath = clusterMatch[2]; // Preserved verbatim
+    return `https://archive.org/download/${identifier}/${rawFilePath}`;
+  }
+
+  return trimmed;
+}
+
+/**
+ * Archive.org native <iframe> embed URL helper:
+ * https://archive.org/embed/IDENTIFIER/FILE
+ */
+export function formatArchiveEmbedUrl(rawUrl: string): string | null {
+  if (!rawUrl) return null;
+  const trimmed = rawUrl.trim();
+
+  // Specific file embed
+  const stdMatch = trimmed.match(/^https?:\/\/(?:www\.)?archive\.org\/(?:download|details|embed|cors|metadata)\/([^/?#]+)\/(.+)$/i);
+  if (stdMatch) {
+    const identifier = stdMatch[1];
+    const rawFilePath = stdMatch[2];
+    return `https://archive.org/embed/${identifier}/${rawFilePath}?autoplay=1`;
+  }
+
+  const clusterMatch = trimmed.match(/^https?:\/\/[a-z0-9_.-]*archive\.org\/(?:\d+\/)?items\/([^/?#]+)\/(.+)$/i);
+  if (clusterMatch) {
+    const identifier = clusterMatch[1];
+    const rawFilePath = clusterMatch[2];
+    return `https://archive.org/embed/${identifier}/${rawFilePath}?autoplay=1`;
+  }
+
+  // Item root embed
+  const rootMatch = trimmed.match(/^https?:\/\/(?:www\.)?archive\.org\/(?:download|details|embed|cors|metadata)\/([^/?#]+)/i);
+  if (rootMatch) {
+    return `https://archive.org/embed/${rootMatch[1]}?autoplay=1`;
+  }
+
+  return null;
 }
 
 /**
  * Step 1: The Parser Utility (utils/m3uParser.ts)
  * 
  * Strict Codebase Protection Rules:
- * 1. Zero Mock Data: Parses exclusively real .m3u production manifests.
- * 2. Preserve Raw URL Encodings: Stream URLs are extracted EXACTLY as written.
- *    No decodeURI/encodeURI manipulation that breaks native Archive.org or CDN links.
- * 3. One File Per Show: Respects 1-file-per-show grouping, keeping all multi-season
- *    and multi-episode data structured under its parent show title.
+ * 1. Purge All Phony Data: Parses exclusively real .m3u production manifests.
+ * 2. Strict Permalink Routing: All Archive.org media routed strictly to https://archive.org/download/IDENTIFIER/FILE
+ * 3. Zero-Alteration Encoding: When extracting FILE portion, preserves the exact text string without decoders or re-encoding.
+ * 4. 1-File-Per-Show Structure: Groups all multi-season and multi-episode data under its parent show title.
  */
 export function parseM3UContent(rawText: string, options: M3UParseOptions = {}): ParsedShowManifest {
   const {
@@ -30,18 +94,29 @@ export function parseM3UContent(rawText: string, options: M3UParseOptions = {}):
     fallbackPoster,
     channelId = "ch-parsed",
     channelName,
+    sourceFilename,
   } = options;
+
+  // Infer show name from filename if provided (e.g., "The_Twilight_Zone.m3u" -> "The Twilight Zone")
+  let inferredShowNameFromFilename = "";
+  if (sourceFilename) {
+    inferredShowNameFromFilename = sourceFilename
+      .replace(/\.m3u8?$/i, "")
+      .replace(/[_-]+/g, " ")
+      .trim();
+  }
 
   if (!rawText || !rawText.trim()) {
     return {
-      showTitle: channelName || "Unknown Show",
+      showTitle: channelName || inferredShowNameFromFilename || "Show Collection",
       channelId,
       totalDurationSec: 0,
       episodes: [],
+      sourceFilename,
     };
   }
 
-  // Normalize line breaks without altering URL encoding
+  // Normalize line breaks without altering URL string encodings
   let normalizedText = rawText;
   if (!normalizedText.includes("\n") && normalizedText.includes("#EXTINF:")) {
     normalizedText = normalizedText
@@ -52,7 +127,7 @@ export function parseM3UContent(rawText: string, options: M3UParseOptions = {}):
   const lines = normalizedText.split(/\r?\n/);
   const episodes: Episode[] = [];
 
-  let parentShowTitle = channelName || "";
+  let parentShowTitle = channelName || inferredShowNameFromFilename || "";
   let currentTitle = "";
   let currentGroup = fallbackGroup;
   let currentLogo = fallbackPoster || "";
@@ -151,17 +226,19 @@ export function parseM3UContent(rawText: string, options: M3UParseOptions = {}):
       !trimmed.startsWith("#") &&
       (trimmed.startsWith("http://") || trimmed.startsWith("https://") || trimmed.startsWith("/"))
     ) {
-      // PRESERVE RAW URL ENCODINGS: Use raw line directly without decode/encode mutations
-      const rawStreamUrl = trimmed;
+      // STRICT PERMALINK ROUTING & ZERO-ALTERATION ENCODING
+      const rawStreamUrl = formatArchivePermalink(trimmed);
 
       // Infer show title if still blank
       if (!parentShowTitle) {
         if (currentGroup && currentGroup !== "General") {
           parentShowTitle = currentGroup;
+        } else if (inferredShowNameFromFilename) {
+          parentShowTitle = inferredShowNameFromFilename;
         } else if (currentTitle) {
           parentShowTitle = currentTitle.split(/[-–—:]/)[0].trim();
         } else {
-          parentShowTitle = channelName || "Linear Broadcast";
+          parentShowTitle = channelName || "Show Collection";
         }
       }
 
@@ -170,9 +247,9 @@ export function parseM3UContent(rawText: string, options: M3UParseOptions = {}):
         epFinalTitle = `Episode ${currentEpisodeNumber}`;
       }
 
-      // Check Archive item thumbnail fallback
+      // Check Archive item thumbnail
       let finalPoster = currentLogo || fallbackPoster;
-      const archiveMatch = rawStreamUrl.match(/archive\.org\/(?:download|details|cors)\/([^/?#]+)/i);
+      const archiveMatch = rawStreamUrl.match(/archive\.org\/(?:download|details|embed|cors)\/([^/?#]+)/i);
       if (!finalPoster && archiveMatch) {
         finalPoster = `https://archive.org/services/img/${archiveMatch[1]}`;
       }
@@ -183,17 +260,19 @@ export function parseM3UContent(rawText: string, options: M3UParseOptions = {}):
         currentEpisodeNumber > 1 ||
         rawStreamUrl.toLowerCase().includes(".mp4");
 
+      const showChannelId = channelId !== "ch-parsed" ? channelId : `show-${parentShowTitle.toLowerCase().replace(/[^a-z0-9]/g, "-")}`;
+
       const episodeItem: Episode = {
-        id: `${channelId}-ep-${episodes.length + 1}-${Math.random().toString(36).substring(2, 7)}`,
+        id: `${showChannelId}-ep-${episodes.length + 1}-${Math.random().toString(36).substring(2, 7)}`,
         season: currentSeason,
         episode: currentEpisodeNumber,
         title: epFinalTitle,
         duration: currentDuration,
-        url: rawStreamUrl, // EXACT raw URL preserved
+        url: rawStreamUrl, // EXACT raw URL preserved with strict permalink structure
         status: "valid",
-        groupTitle: currentGroup,
-        tvgId: currentTvgId,
-        tvgName: currentTvgName,
+        groupTitle: parentShowTitle,
+        tvgId: currentTvgId || showChannelId,
+        tvgName: currentTvgName || parentShowTitle,
         tvgLogo: finalPoster,
         thumbnailUrl: finalPoster,
         sourceHost: archiveMatch ? "archive.org" : "direct-stream",
@@ -217,10 +296,11 @@ export function parseM3UContent(rawText: string, options: M3UParseOptions = {}):
   const totalDurationSec = episodes.reduce((acc, ep) => acc + (ep.duration || 1800), 0);
 
   return {
-    showTitle: parentShowTitle || channelName || "Show Collection",
-    channelId,
+    showTitle: parentShowTitle || channelName || inferredShowNameFromFilename || "Show Collection",
+    channelId: channelId !== "ch-parsed" ? channelId : `show-${(parentShowTitle || "collection").toLowerCase().replace(/[^a-z0-9]/g, "-")}`,
     totalDurationSec,
     episodes,
+    sourceFilename,
   };
 }
 

@@ -1,10 +1,11 @@
 import React, { useEffect, useRef, useState } from "react";
 import Hls from "hls.js";
-import { AlertTriangle, RefreshCw, Film, ExternalLink, Globe, Radio, Play, CheckCircle2 } from "lucide-react";
-import { normalizeStreamUrl, getCorsProxyUrls } from "../utils/archiveHarvesterDB";
+import { AlertTriangle, RefreshCw, ShieldAlert, Globe, ExternalLink, HelpCircle } from "lucide-react";
+import { diagnoseStreamError, DiagnosticResult } from "../utils/streamDiagnostics";
 
-interface HlsVideoPlayerProps {
+export interface HlsVideoPlayerProps {
   src: string;
+  fallbackSrc?: string;
   autoPlay?: boolean;
   loop?: boolean;
   muted?: boolean;
@@ -13,231 +14,51 @@ interface HlsVideoPlayerProps {
   seekTime?: number;
   onTimeUpdate?: (currentTime: number, duration: number) => void;
   onError?: (error: any) => void;
-  fallbackSrc?: string;
-}
-
-// Extract Archive.org item identifier if present
-function getArchiveOrgDetails(url: string) {
-  if (!url) return { isArchive: false, itemId: null, embedUrl: null };
-  const match = url.match(/archive\.org\/(?:download|details|embed|cors)\/([^/?#]+)/i);
-  if (match) {
-    return {
-      isArchive: true,
-      itemId: match[1],
-      embedUrl: `https://archive.org/embed/${match[1]}?autoplay=1`,
-    };
-  }
-  return { isArchive: false, itemId: null, embedUrl: null };
 }
 
 export const HlsVideoPlayer: React.FC<HlsVideoPlayerProps> = ({
   src,
+  fallbackSrc = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
   autoPlay = true,
   loop = true,
   muted = false,
-  controls = false,
-  className = "w-full h-full object-cover",
+  controls = true,
+  className = "w-full h-full object-contain",
   seekTime,
   onTimeUpdate,
   onError,
-  fallbackSrc = "https://archive.org/download/Tears-of-Steel/tears_of_steel_720p.mp4",
 }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
   const hlsRef = useRef<Hls | null>(null);
-  const proxyAttemptIndexRef = useRef<number>(0);
-  const animFrameRef = useRef<number | null>(null);
+  const [hasError, setHasError] = useState(false);
+  const [diagnostic, setDiagnostic] = useState<DiagnosticResult | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isUsingFallback, setIsUsingFallback] = useState(false);
+  const [useProxy, setUseProxy] = useState(false);
+  const [showDiagModal, setShowDiagModal] = useState(false);
   const hasAppliedInitialSeekRef = useRef<boolean>(false);
 
-  const [isLoading, setIsLoading] = useState<boolean>(true);
-  const [hasError, setHasError] = useState<boolean>(false);
-  const [isUsingFallback, setIsUsingFallback] = useState<boolean>(false);
-  const [showTestPattern, setShowTestPattern] = useState<boolean>(false);
-  const [useArchiveEmbed, setUseArchiveEmbed] = useState<boolean>(false);
-  const [activeProxyUrl, setActiveProxyUrl] = useState<string | null>(null);
-  const [currentResolution, setCurrentResolution] = useState<string>("1080p60");
-
-  const normalizedSrc = normalizeStreamUrl(src || fallbackSrc);
-  const archiveInfo = getArchiveOrgDetails(src || "");
-
-  // Reset retry counter whenever the source changes
-  useEffect(() => {
-    proxyAttemptIndexRef.current = 0;
-    setShowTestPattern(false);
-    setUseArchiveEmbed(false);
-    setIsUsingFallback(false);
-    setActiveProxyUrl(null);
-    setHasError(false);
-    setIsLoading(true);
-  }, [src]);
-
-  const handleManualRetry = () => {
-    proxyAttemptIndexRef.current = 0;
-    setShowTestPattern(false);
-    setUseArchiveEmbed(false);
-    setIsUsingFallback(false);
-    setActiveProxyUrl(null);
-    setHasError(false);
-    setIsLoading(true);
-  };
-
-  const handleForceDirectPlayback = () => {
-    setShowTestPattern(false);
-    setUseArchiveEmbed(false);
-    setIsUsingFallback(false);
-    setActiveProxyUrl(null);
-    proxyAttemptIndexRef.current = 0;
-    setIsLoading(true);
-  };
-
-  // Draw animated SMPTE broadcast test pattern on fallback canvas
-  useEffect(() => {
-    if (!showTestPattern) {
-      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
-      return;
-    }
-
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    let frame = 0;
-    const drawPattern = () => {
-      frame++;
-      const w = canvas.width;
-      const h = canvas.height;
-
-      // Top 67% SMPTE color bars
-      const topH = Math.floor(h * 0.67);
-      const barColors = [
-        "#c0c0c0", // Gray
-        "#c0c000", // Yellow
-        "#00c0c0", // Cyan
-        "#00c000", // Green
-        "#c000c0", // Magenta
-        "#c000c0", // Red
-        "#0000c0", // Blue
-      ];
-      const barW = w / barColors.length;
-      barColors.forEach((color, i) => {
-        ctx.fillStyle = color;
-        ctx.fillRect(i * barW, 0, barW, topH);
-      });
-
-      // Middle 8% Castellation bars
-      const midH = Math.floor(h * 0.08);
-      const midColors = [
-        "#0000c0",
-        "#131313",
-        "#c000c0",
-        "#131313",
-        "#00c0c0",
-        "#131313",
-        "#c0c0c0",
-      ];
-      midColors.forEach((color, i) => {
-        ctx.fillStyle = color;
-        ctx.fillRect(i * barW, topH, barW, midH);
-      });
-
-      // Bottom 25% PLUGE and Black level
-      const botH = h - topH - midH;
-      ctx.fillStyle = "#0a0a0f";
-      ctx.fillRect(0, topH + midH, w, botH);
-
-      // Station ID & Matrix Radar OSD
-      ctx.fillStyle = "#0088FF";
-      ctx.font = "bold 14px monospace";
-      ctx.fillText("M3U MATRIX BROADCAST FEED", 20, topH + midH + 25);
-
-      ctx.fillStyle = "#00FF9D";
-      ctx.font = "11px monospace";
-      const now = new Date();
-      ctx.fillText(
-        `CARRIER NOMINAL // UTC: ${now.toISOString().slice(11, 19)} // SYNTH 1080p60`,
-        20,
-        topH + midH + 45
-      );
-
-      // Animated Frequency Visualizer Bars
-      const numFrequencies = 24;
-      const freqStartX = w - 220;
-      for (let i = 0; i < numFrequencies; i++) {
-        const barHeight = Math.abs(Math.sin((frame + i * 8) * 0.05)) * 24 + 4;
-        ctx.fillStyle = i % 2 === 0 ? "#0088FF" : "#00FF9D";
-        ctx.fillRect(freqStartX + i * 8, topH + midH + 45 - barHeight, 6, barHeight);
-      }
-
-      // Scanline animation effect
-      const scanY = (frame * 2) % h;
-      ctx.fillStyle = "rgba(255, 255, 255, 0.08)";
-      ctx.fillRect(0, scanY, w, 2);
-
-      animFrameRef.current = requestAnimationFrame(drawPattern);
-    };
-
-    drawPattern();
-
-    return () => {
-      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
-    };
-  }, [showTestPattern]);
-
-  // Main stream loading & HLS/HTML5 playback effect
   useEffect(() => {
     const video = videoRef.current;
-    if (!video || useArchiveEmbed || showTestPattern) return;
+    if (!video) return;
 
     setHasError(false);
+    setDiagnostic(null);
     setIsLoading(true);
+    setIsUsingFallback(false);
+    hasAppliedInitialSeekRef.current = false;
 
-    // Clean up previous Hls instance if exists
     if (hlsRef.current) {
       hlsRef.current.destroy();
       hlsRef.current = null;
     }
 
-    let streamUrl = activeProxyUrl || (isUsingFallback ? fallbackSrc : normalizedSrc);
-    const isM3uPlaylist =
-      (streamUrl.toLowerCase().endsWith(".m3u") || streamUrl.toLowerCase().includes(".m3u?")) &&
-      !streamUrl.toLowerCase().includes(".m3u8");
-    if (isM3uPlaylist) {
-      setIsLoading(true);
-      return;
+    let rawUrl = src || fallbackSrc;
+    let streamUrl = rawUrl;
+
+    if (useProxy && rawUrl.startsWith("http")) {
+      streamUrl = `https://corsproxy.io/?${encodeURIComponent(rawUrl)}`;
     }
-
-    const isM3u8 =
-      streamUrl.includes(".m3u8") ||
-      streamUrl.includes("m3u8") ||
-      streamUrl.includes("/hls");
-
-    // Unified CORS Relay Watchdog Failover Handler
-    const handlePlaybackFailure = (reason?: string) => {
-      const candidates = getCorsProxyUrls(src || fallbackSrc);
-      proxyAttemptIndexRef.current += 1;
-      const nextIdx = proxyAttemptIndexRef.current;
-
-      // Try next CORS proxy candidate automatically
-      if (nextIdx < candidates.length - 1) {
-        const nextProxy = candidates[nextIdx];
-        setActiveProxyUrl(nextProxy);
-        return;
-      }
-
-      // If all proxy candidates fail, try verified fallback stream once
-      if (!isUsingFallback) {
-        setIsUsingFallback(true);
-        setActiveProxyUrl(null);
-        return;
-      }
-
-      // Finally, engage broadcast test pattern
-      setIsLoading(false);
-      setHasError(true);
-      setShowTestPattern(true);
-      if (onError) onError(reason || "Fallback test signal engaged");
-    };
 
     const applyInitialSeek = () => {
       if (seekTime && seekTime > 0 && !hasAppliedInitialSeekRef.current && video) {
@@ -250,24 +71,26 @@ export const HlsVideoPlayer: React.FC<HlsVideoPlayerProps> = ({
       }
     };
 
+    const isM3u8 =
+      streamUrl.includes(".m3u8") ||
+      streamUrl.includes("m3u8") ||
+      streamUrl.includes("/hls");
+
     if (isM3u8 && Hls.isSupported()) {
       const hls = new Hls({
         enableWorker: true,
+        manifestLoadingTimeOut: 8000,
         lowLatencyMode: true,
         backBufferLength: 90,
       });
-      hlsRef.current = hls;
 
+      hlsRef.current = hls;
       hls.loadSource(streamUrl);
       hls.attachMedia(video);
 
-      hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
         setIsLoading(false);
         applyInitialSeek();
-        if (data.levels && data.levels.length > 0) {
-          const maxLevel = data.levels[data.levels.length - 1];
-          if (maxLevel.height) setCurrentResolution(`${maxLevel.height}p`);
-        }
         if (autoPlay) {
           video.play().catch(() => {
             video.muted = true;
@@ -276,65 +99,44 @@ export const HlsVideoPlayer: React.FC<HlsVideoPlayerProps> = ({
         }
       });
 
-      hls.on(Hls.Events.LEVEL_SWITCHED, (_, data) => {
-        const level = hls.levels[data.level];
-        if (level && level.height) {
-          setCurrentResolution(`${level.height}p`);
-        }
-      });
-
       hls.on(Hls.Events.ERROR, (_, data) => {
         if (data.fatal) {
-          switch (data.type) {
-            case Hls.ErrorTypes.NETWORK_ERROR:
-              hls.startLoad();
-              break;
-            case Hls.ErrorTypes.MEDIA_ERROR:
-              hls.recoverMediaError();
-              break;
-            default:
-              hls.destroy();
-              hlsRef.current = null;
-              handlePlaybackFailure("HLS fatal unrecoverable error");
-              break;
-          }
+          const diag = diagnoseStreamError(src, data);
+          setDiagnostic(diag);
+          if (onError) onError(diag);
+          hls.destroy();
+          hlsRef.current = null;
+          setHasError(true);
+          setIsUsingFallback(true);
+          video.src = fallbackSrc;
+          video.play().catch(() => {});
         }
       });
-    } else if (isM3u8 && video.canPlayType("application/vnd.apple.mpegurl")) {
+    } else {
       video.src = streamUrl;
       const onLoaded = () => {
         setIsLoading(false);
         applyInitialSeek();
-        if (autoPlay) video.play().catch(() => {});
-      };
-      const onErr = () => {
-        handlePlaybackFailure("Native Safari HLS error");
+        if (autoPlay) {
+          video.play().catch(() => {
+            video.muted = true;
+            video.play().catch(() => {});
+          });
+        }
       };
 
-      video.addEventListener("loadedmetadata", onLoaded, { once: true });
+      const onErr = (e: any) => {
+        setHasError(true);
+        const diag = diagnoseStreamError(src, e);
+        setDiagnostic(diag);
+        if (onError) onError(diag);
+        setIsUsingFallback(true);
+        video.src = fallbackSrc;
+        video.play().catch(() => {});
+      };
+
+      video.addEventListener("loadeddata", onLoaded, { once: true });
       video.addEventListener("error", onErr, { once: true });
-    } else {
-      // Direct MP4 / WebM / OGV video stream (Native HTML5 Media)
-      video.src = streamUrl;
-      video.onloadeddata = () => {
-        setIsLoading(false);
-        applyInitialSeek();
-      };
-      video.oncanplay = () => {
-        setIsLoading(false);
-        applyInitialSeek();
-      };
-      video.onerror = () => {
-        video.onerror = null;
-        handlePlaybackFailure("Direct media error");
-      };
-
-      if (autoPlay) {
-        video.play().catch(() => {
-          video.muted = true;
-          video.play().catch(() => {});
-        });
-      }
     }
 
     const handleTimeUpdate = () => {
@@ -347,169 +149,107 @@ export const HlsVideoPlayer: React.FC<HlsVideoPlayerProps> = ({
 
     return () => {
       video.removeEventListener("timeupdate", handleTimeUpdate);
-      video.onerror = null;
       if (hlsRef.current) {
         hlsRef.current.destroy();
         hlsRef.current = null;
       }
     };
-  }, [normalizedSrc, fallbackSrc, autoPlay, useArchiveEmbed, activeProxyUrl, isUsingFallback, showTestPattern]);
+  }, [src, fallbackSrc, autoPlay, useProxy, seekTime]);
 
   return (
-    <div className="relative w-full h-full flex items-center justify-center bg-black overflow-hidden group select-none">
-      {showTestPattern ? (
-        /* Standalone Broadcast Test Signal Canvas with interactive action overlay */
-        <div className="relative w-full h-full">
-          <canvas
-            ref={canvasRef}
-            width={640}
-            height={360}
-            className="w-full h-full object-cover"
-          />
-          <div className="absolute inset-0 bg-black/50 flex flex-col items-center justify-center p-4 text-center z-15 backdrop-blur-[2px]">
-            <div className="glass-card p-4 max-w-sm rounded-xl border border-white/20 shadow-2xl space-y-3">
-              <div className="flex items-center justify-center gap-2 text-amber-400 font-mono text-xs font-bold">
-                <AlertTriangle className="w-4 h-4 text-amber-400" />
-                <span>Stream Sync Interrupted</span>
-              </div>
-              <p className="text-[11px] text-white/70 font-mono">
-                The stream requires decoder re-sync or CORS proxy relay.
-              </p>
-              <div className="flex flex-wrap items-center justify-center gap-2 font-mono text-xs pt-1">
-                <button
-                  onClick={handleForceDirectPlayback}
-                  className="px-3 py-1.5 bg-[#0088FF] hover:bg-[#0070D0] text-white font-bold rounded-lg shadow-md flex items-center gap-1.5 cursor-pointer transition-all"
-                >
-                  <Play className="w-3.5 h-3.5 fill-white" />
-                  <span>Direct Play</span>
-                </button>
-                <button
-                  onClick={() => {
-                    const candidates = getCorsProxyUrls(src || fallbackSrc);
-                    setActiveProxyUrl(candidates[1] || candidates[0]);
-                    handleManualRetry();
-                  }}
-                  className="px-3 py-1.5 bg-emerald-600/80 hover:bg-emerald-600 text-white font-bold rounded-lg shadow-md flex items-center gap-1.5 cursor-pointer transition-all"
-                >
-                  <Globe className="w-3.5 h-3.5" />
-                  <span>CORS Relay</span>
-                </button>
-                <button
-                  onClick={handleManualRetry}
-                  className="px-3 py-1.5 bg-white/10 hover:bg-white/20 text-white rounded-lg border border-white/10 flex items-center gap-1.5 cursor-pointer transition-all"
-                >
-                  <RefreshCw className="w-3.5 h-3.5" />
-                  <span>Retry Signal</span>
-                </button>
-              </div>
-            </div>
+    <div className="relative w-full h-full flex items-center justify-center bg-black overflow-hidden group">
+      <video
+        ref={videoRef}
+        className={className}
+        controls={controls}
+        loop={loop}
+        muted={muted}
+        playsInline
+        referrerPolicy="no-referrer"
+      />
+
+      {/* Loading Spinner */}
+      {isLoading && (
+        <div className="absolute inset-0 flex items-center justify-center bg-black/60 backdrop-blur-sm z-10">
+          <RefreshCw className="w-8 h-8 text-blue-500 animate-spin" />
+        </div>
+      )}
+
+      {/* Watchdog Bar */}
+      {isUsingFallback && (
+        <div className="absolute top-3 left-3 right-3 z-20 flex flex-wrap items-center justify-between gap-2 pointer-events-auto">
+          <div className="bg-amber-500/95 text-black font-mono font-bold text-[10px] px-2.5 py-1 rounded-md flex items-center gap-1.5 shadow-md">
+            <AlertTriangle className="w-3.5 h-3.5 fill-black" />
+            <span>WATCHDOG ENGAGED: {diagnostic ? diagnostic.title : "BACKUP FEED ACTIVE"}</span>
+          </div>
+
+          <div className="flex items-center gap-1.5 font-mono text-[10px]">
+            <button
+              onClick={() => setUseProxy(!useProxy)}
+              className={`px-2.5 py-1 rounded-md border font-bold flex items-center gap-1 transition-all cursor-pointer ${
+                useProxy
+                  ? "bg-[#0088FF] border-[#0088FF] text-white"
+                  : "bg-black/70 border-white/20 text-white/80 hover:bg-white/10"
+              }`}
+            >
+              <Globe className="w-3 h-3" />
+              <span>{useProxy ? "CORS Relay: ON" : "Try CORS Relay"}</span>
+            </button>
+
+            <button
+              onClick={() => setShowDiagModal(!showDiagModal)}
+              className="px-2 py-1 rounded-md bg-black/70 border border-white/20 text-white/80 hover:text-white flex items-center gap-1 cursor-pointer"
+            >
+              <HelpCircle className="w-3 h-3 text-amber-400" />
+              <span>Why Stalled?</span>
+            </button>
           </div>
         </div>
-      ) : useArchiveEmbed && archiveInfo.embedUrl ? (
-        /* Archive.org Native Web Player Embed IFrame */
-        <iframe
-          src={archiveInfo.embedUrl}
-          title="Archive.org Stream Player"
-          className="w-full h-full border-0"
-          allow="autoplay; fullscreen"
-        />
-      ) : (
-        /* HTML5 Native / HLS.js Video Element */
-        <video
-          ref={videoRef}
-          autoPlay={autoPlay}
-          loop={loop}
-          muted={muted}
-          controls={controls}
-          playsInline
-          preload="auto"
-          referrerPolicy="no-referrer"
-          className={className}
-        />
       )}
 
-      {/* Loading Overlay */}
-      {isLoading && !showTestPattern && (
-        <div className="absolute inset-0 bg-black/75 backdrop-blur-xs flex items-center justify-center z-10 font-mono text-xs text-[#0088FF] space-x-2">
-          <RefreshCw className="w-4 h-4 animate-spin text-[#0088FF]" />
-          <span>DECODING SIGNAL [{archiveInfo.isArchive ? "ARCHIVE.ORG" : currentResolution}]...</span>
-        </div>
-      )}
-
-      {/* Stream Badges & Controls Header Bar */}
-      <div className="absolute top-3 left-3 right-3 z-20 flex flex-wrap items-center justify-between gap-2 pointer-events-none">
-        <div className="flex items-center gap-2 pointer-events-auto">
-          {archiveInfo.isArchive && (
-            <div className="bg-[#0088FF]/90 text-white font-mono font-bold text-[10px] px-2.5 py-1 rounded-md flex items-center gap-1.5 shadow-md backdrop-blur-md">
-              <Film className="w-3.5 h-3.5 text-white" />
-              <span>ARCHIVE.ORG DIRECT</span>
+      {/* Diagnostic Overlay Modal */}
+      {showDiagModal && diagnostic && (
+        <div className="absolute inset-4 z-30 bg-[#05070A]/95 border border-amber-500/40 rounded-2xl p-4 font-mono text-xs text-white backdrop-blur-xl shadow-2xl flex flex-col justify-between animate-in fade-in">
+          <div className="space-y-3">
+            <div className="flex items-center justify-between border-b border-white/10 pb-2">
+              <div className="flex items-center gap-2 text-amber-400 font-bold">
+                <ShieldAlert className="w-4 h-4" />
+                <span>STREAM DIAGNOSTIC REPORT</span>
+              </div>
+              <button
+                onClick={() => setShowDiagModal(false)}
+                className="px-2 py-0.5 bg-white/10 hover:bg-white/20 rounded text-[10px] cursor-pointer"
+              >
+                Close
+              </button>
             </div>
-          )}
 
-          {activeProxyUrl && (
-            <div className="bg-emerald-500/90 text-black font-mono font-bold text-[10px] px-2.5 py-1 rounded-md flex items-center gap-1.5 shadow-md">
-              <Globe className="w-3.5 h-3.5" />
-              <span>CORS PROXY ACTIVE</span>
+            <div>
+              <div className="text-[11px] text-white/50 uppercase">Issue Identified</div>
+              <div className="text-white font-bold text-sm mt-0.5">{diagnostic.title}</div>
+              <p className="text-white/70 text-[11px] mt-1 leading-relaxed">{diagnostic.description}</p>
             </div>
-          )}
 
-          {showTestPattern ? (
-            <div className="bg-[#0088FF]/90 text-white font-mono font-bold text-[10px] px-2.5 py-1 rounded-md flex items-center gap-1.5 shadow-md">
-              <Radio className="w-3.5 h-3.5 animate-pulse text-[#00FF9D]" />
-              <span>TEST SIGNAL 1080p60 ACTIVE</span>
+            <div className="p-2.5 bg-white/5 border border-white/10 rounded-xl space-y-1">
+              <div className="text-[10px] text-[#0088FF] font-bold uppercase">Recommended Fix</div>
+              <div className="text-white/90 text-[11px]">{diagnostic.solution}</div>
             </div>
-          ) : isUsingFallback ? (
-            <div className="bg-amber-500/95 text-black font-mono font-bold text-[10px] px-2.5 py-1 rounded-md flex items-center gap-1.5 shadow-md">
-              <AlertTriangle className="w-3.5 h-3.5 fill-black" />
-              <span>WATCHDOG BACKUP ACTIVE</span>
-            </div>
-          ) : null}
-        </div>
+          </div>
 
-        {/* Hover Action Controls */}
-        <div className="flex items-center gap-1.5 font-mono text-[10px] pointer-events-auto opacity-0 group-hover:opacity-100 transition-opacity">
-          {archiveInfo.isArchive && (
-            <button
-              onClick={() => setUseArchiveEmbed(!useArchiveEmbed)}
-              className="px-2.5 py-1 rounded-md bg-black/80 hover:bg-[#0088FF] border border-white/20 hover:border-[#0088FF] text-white flex items-center gap-1 transition-all cursor-pointer shadow-lg"
-              title="Toggle between HTML5 Direct Video & Archive.org Web Player"
+          <div className="flex items-center justify-between pt-2 border-t border-white/10 text-[10px]">
+            <a
+              href={src}
+              target="_blank"
+              rel="noreferrer"
+              className="text-[#0088FF] hover:underline flex items-center gap-1"
             >
-              <Film className="w-3 h-3 text-[#0088FF]" />
-              <span>{useArchiveEmbed ? "HTML5 Direct" : "Archive Embed"}</span>
-            </button>
-          )}
-
-          <button
-            onClick={() => {
-              if (activeProxyUrl) {
-                setActiveProxyUrl(null);
-              } else {
-                const candidates = getCorsProxyUrls(src || fallbackSrc);
-                setActiveProxyUrl(candidates[1] || candidates[0]);
-              }
-            }}
-            className={`px-2.5 py-1 rounded-md border font-bold flex items-center gap-1 transition-all cursor-pointer ${
-              activeProxyUrl
-                ? "bg-emerald-600 border-emerald-500 text-white"
-                : "bg-black/80 border-white/20 text-white/80 hover:bg-white/10"
-            }`}
-            title="Route stream through automated CORS bypass proxy watchdog"
-          >
-            <Globe className="w-3 h-3" />
-            <span>{activeProxyUrl ? "CORS Relay: ON" : "CORS Relay"}</span>
-          </button>
-
-          <a
-            href={src}
-            target="_blank"
-            rel="noreferrer"
-            className="px-2 py-1 rounded-md bg-black/80 border border-white/20 text-white/80 hover:text-white flex items-center gap-1 cursor-pointer"
-            title="Open stream URL in new tab"
-          >
-            <ExternalLink className="w-3 h-3" />
-          </a>
+              <span>Open Raw URL</span>
+              <ExternalLink className="w-3 h-3" />
+            </a>
+            <span className="text-white/40">Nexus TV-O Watchdog Core</span>
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 };

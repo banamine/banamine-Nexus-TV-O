@@ -8,24 +8,24 @@ import {
   Search, 
   Zap, 
   CheckCircle2, 
-  Radio, 
   Film, 
   X, 
-  Volume2, 
-  Maximize2,
-  ChevronRight,
-  Sparkles,
+  Upload,
   Layers,
-  Info
+  Info,
+  PlusCircle,
+  FileText
 } from "lucide-react";
 import { Episode } from "../types";
 import { calculateLiveSchedule, LiveChannelSchedule, formatTimeSlot } from "../utils/epgScheduler";
 import { useSmartResume } from "../hooks/useSmartResume";
 import { HlsVideoPlayer } from "./HlsVideoPlayer";
+import { parseM3UContent } from "../utils/m3uParser";
 
 interface EPGMatrixProps {
   episodes: Episode[];
   onSelectChannel?: (ep: Episode) => void;
+  onImportEpisodes?: (newEps: Episode[]) => void;
   className?: string;
 }
 
@@ -40,11 +40,16 @@ interface ChannelGroup {
 export const EPGMatrix: React.FC<EPGMatrixProps> = ({
   episodes,
   onSelectChannel,
+  onImportEpisodes,
   className = "",
 }) => {
   const [currentWallClockMs, setCurrentWallClockMs] = useState<number>(() => Date.now());
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [selectedCategory, setSelectedCategory] = useState<string>("All");
+  const [isUploading, setIsUploading] = useState<boolean>(false);
+  const [uploadFeedback, setUploadFeedback] = useState<string | null>(null);
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
   
   // Selected channel for active playback (Lazy-loaded player instance)
   const [activePlayback, setActivePlayback] = useState<{
@@ -64,6 +69,49 @@ export const EPGMatrix: React.FC<EPGMatrixProps> = ({
     }, 10000);
     return () => clearInterval(timer);
   }, []);
+
+  // Handle local .m3u file upload (supporting single or batch 1-file-per-show manifests)
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+
+    setIsUploading(true);
+    setUploadFeedback("Reading and parsing .m3u show file(s)...");
+
+    const allNewEpisodes: Episode[] = [];
+
+    let filesRead = 0;
+    Array.from(files).forEach((file: File) => {
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        const text = event.target?.result as string;
+        if (text) {
+          const parsed = parseM3UContent(text, {
+            sourceFilename: file.name,
+            channelName: file.name.replace(/\.m3u8?$/i, "").replace(/[_-]+/g, " "),
+          });
+          if (parsed.episodes && parsed.episodes.length > 0) {
+            allNewEpisodes.push(...parsed.episodes);
+          }
+        }
+        filesRead++;
+        if (filesRead === files.length) {
+          setIsUploading(false);
+          if (allNewEpisodes.length > 0) {
+            if (onImportEpisodes) {
+              onImportEpisodes(allNewEpisodes);
+            }
+            setUploadFeedback(`Successfully imported ${allNewEpisodes.length} tracks across ${files.length} show manifest(s).`);
+            setTimeout(() => setUploadFeedback(null), 4000);
+          } else {
+            setUploadFeedback("No valid tracks were found in the uploaded file(s).");
+            setTimeout(() => setUploadFeedback(null), 4000);
+          }
+        }
+      };
+      reader.readAsText(file);
+    });
+  };
 
   // Group flat episodes into Show/Channel Groups (1-file-per-show architecture)
   const channelGroups = useMemo<ChannelGroup[]>(() => {
@@ -188,34 +236,60 @@ export const EPGMatrix: React.FC<EPGMatrixProps> = ({
             <div className="flex items-center gap-2">
               <h2 className="text-lg font-black text-white uppercase tracking-tight">24-Hour EPG Playout Matrix</h2>
               <span className="px-2 py-0.5 text-[10px] font-mono font-bold bg-[#00FF9D]/15 text-[#00FF9D] border border-[#00FF9D]/30 rounded uppercase tracking-wider">
-                Deterministic Sync
+                1-File-Per-Show
               </span>
             </div>
             <p className="text-xs text-white/50">
-              Live wall-clock modulo scheduling with 20-minute Smart Resume tracking and lazy-loaded stream mounting.
+              Live modulo playout sync, strict permalink routing, and zero-alteration Archive.org media preservation.
             </p>
           </div>
         </div>
 
-        {/* Current Time Clock & Filter */}
-        <div className="flex items-center gap-3 w-full md:w-auto">
+        {/* Current Time Clock, Search & Upload Trigger */}
+        <div className="flex flex-wrap items-center gap-2.5 w-full md:w-auto">
           <div className="flex items-center gap-2 bg-[#05070A] border border-white/10 px-3 py-1.5 rounded-xl font-mono text-xs text-white/80">
             <Clock className="w-3.5 h-3.5 text-[#0088FF] animate-spin-slow" />
             <span>{formatTimeSlot(currentWallClockMs)}</span>
           </div>
 
-          <div className="relative flex-1 md:w-56">
+          <div className="relative flex-1 sm:w-48">
             <Search className="w-3.5 h-3.5 text-white/40 absolute left-3 top-1/2 -translate-y-1/2" />
             <input
               type="text"
-              placeholder="Search guide & shows..."
+              placeholder="Search matrix..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               className="w-full bg-[#05070A] border border-white/10 focus:border-[#0088FF] text-xs rounded-xl pl-8 pr-3 py-1.5 text-white placeholder-white/30 outline-none"
             />
           </div>
+
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".m3u,.m3u8"
+            multiple
+            onChange={handleFileUpload}
+            className="hidden"
+          />
+
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            disabled={isUploading}
+            className="px-3 py-1.5 bg-[#0088FF] hover:bg-[#0070D0] text-white text-xs font-bold rounded-xl shadow-md flex items-center gap-1.5 transition-all cursor-pointer disabled:opacity-50 shrink-0"
+            title="Upload .m3u show file(s) to populate the matrix"
+          >
+            <Upload className="w-3.5 h-3.5" />
+            <span>{isUploading ? "Parsing..." : "Upload .M3U"}</span>
+          </button>
         </div>
       </div>
+
+      {uploadFeedback && (
+        <div className="p-3 rounded-xl bg-[#0088FF]/15 border border-[#0088FF]/30 text-xs font-mono text-white flex items-center gap-2 animate-in fade-in">
+          <CheckCircle2 className="w-4 h-4 text-[#00FF9D] shrink-0" />
+          <span>{uploadFeedback}</span>
+        </div>
+      )}
 
       {/* 2. Category Filter Pills */}
       <div className="flex items-center gap-2 overflow-x-auto pb-1 scrollbar-none font-mono text-xs">
@@ -274,7 +348,7 @@ export const EPGMatrix: React.FC<EPGMatrixProps> = ({
           </div>
 
           {/* Video Player Frame with deterministic seekTimestampSec */}
-          <div className="aspect-video w-full max-h-[420px] rounded-2xl overflow-hidden bg-black border border-white/10 relative shadow-inner">
+          <div className="aspect-video w-full max-h-[440px] rounded-2xl overflow-hidden bg-black border border-white/10 relative shadow-inner">
             <HlsVideoPlayer
               src={activePlayback.episode.url}
               seekTime={activePlayback.seekTimestampSec}
@@ -314,11 +388,11 @@ export const EPGMatrix: React.FC<EPGMatrixProps> = ({
       <div className="bg-[#05070A] rounded-2xl border border-white/10 overflow-hidden font-mono shadow-2xl">
         {/* Timeline Header Row */}
         <div className="grid grid-cols-12 border-b border-white/10 p-3.5 text-xs font-bold text-white/60 bg-[#0D121D] sticky top-0 z-20">
-          <div className="col-span-3 sm:col-span-3 flex items-center gap-2">
+          <div className="col-span-12 sm:col-span-3 flex items-center gap-2">
             <Tv className="w-3.5 h-3.5 text-[#0088FF]" />
-            <span>CHANNEL / SHOW</span>
+            <span>SHOW CHANNEL (1 FILE PER SHOW)</span>
           </div>
-          <div className="col-span-9 sm:col-span-9 grid grid-cols-5 text-center text-white/40">
+          <div className="col-span-12 sm:col-span-9 hidden sm:grid grid-cols-5 text-center text-white/40">
             {headerTimeSlots.map((slot, idx) => (
               <div key={idx} className="truncate px-1">
                 {slot}
@@ -330,8 +404,16 @@ export const EPGMatrix: React.FC<EPGMatrixProps> = ({
         {/* Channels Rows */}
         <div className="divide-y divide-white/5 max-h-[600px] overflow-y-auto">
           {filteredGroups.length === 0 ? (
-            <div className="p-12 text-center text-white/40 text-xs">
-              No active channels or shows match the selected criteria.
+            <div className="p-12 text-center text-white/40 text-xs space-y-3">
+              <Film className="w-8 h-8 text-white/20 mx-auto" />
+              <p>No active shows parsed yet. Upload your .m3u show file(s) to populate the 24-hour linear matrix.</p>
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                className="px-4 py-2 bg-[#0088FF] hover:bg-[#0070D0] text-white text-xs font-bold rounded-xl inline-flex items-center gap-2 cursor-pointer shadow-lg"
+              >
+                <Upload className="w-4 h-4" />
+                <span>Upload .M3U File(s)</span>
+              </button>
             </div>
           ) : (
             filteredGroups.map((group) => {
