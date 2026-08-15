@@ -9,6 +9,7 @@ import {
   Layers, 
   RotateCcw,
   Sparkles,
+  Calendar,
   Lock,
   Unlock
 } from "lucide-react";
@@ -89,6 +90,16 @@ export const Navbar: React.FC<NavbarProps> = ({
             }`}
           >
             <Sparkles className="w-3.5 h-3.5" /> VOD & Series
+          </button>
+          <button
+            onClick={() => onNavigate("epg")}
+            className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
+              currentView === "epg"
+                ? "bg-[#0088FF] text-white shadow-lg shadow-[#0088FF]/40"
+                : "text-white/60 hover:text-white hover:bg-white/5"
+            }`}
+          >
+            <Calendar className="w-3.5 h-3.5" /> EPG Matrix
           </button>
           <button
             onClick={() => onNavigate("multiscreen")}

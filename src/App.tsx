@@ -9,6 +9,7 @@ import { PinShieldModal } from "./components/PinShieldModal";
 import { ImportExportModal } from "./components/ImportExportModal";
 import { ThirdEyePanel } from "./components/ThirdEyePanel";
 import { EPGGuideModal } from "./components/EPGGuideModal";
+import { EPGMatrix } from "./components/EPGMatrix";
 
 import { 
   INITIAL_EPISODES, 
@@ -165,6 +166,17 @@ export default function App() {
           />
         )}
 
+        {currentView === "epg" && (
+          <div className="p-4 sm:p-8 max-w-7xl mx-auto">
+            <EPGMatrix
+              episodes={filteredEpisodes}
+              onSelectChannel={(ep) => {
+                setSelectedEpisode(ep);
+              }}
+            />
+          </div>
+        )}
+
         {currentView === "multiscreen" && (
           <MultiScreenGrid
             episodes={episodes}
@@ -204,8 +216,12 @@ export default function App() {
       <EPGGuideModal
         isOpen={isEPGModalOpen}
         onClose={() => setIsEPGModalOpen(false)}
-        epgGrid={epgGrid}
-        onSelectProgramChannel={handleSelectProgramChannel}
+        episodes={episodes}
+        onSelectEpisode={(ep) => {
+          setSelectedEpisode(ep);
+          setIsEPGModalOpen(false);
+          setCurrentView("live");
+        }}
       />
     </div>
   );

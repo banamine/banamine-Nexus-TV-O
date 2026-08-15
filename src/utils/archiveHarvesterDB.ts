@@ -8,6 +8,7 @@ export interface ArchiveDiscoveredM3U {
   identifier: string;
   groupTitle: string;
   posterUrl: string;
+  chunkFilename: string; // e.g. "daily-highlights.json", "01-tv-fighting-crime.json"
 }
 
 export interface ArchiveFolderScanResult {
@@ -19,14 +20,37 @@ export interface ArchiveFolderScanResult {
   virtualChannels: Episode[];
 }
 
+export interface TitleJsonChunk {
+  chunkFilename: string;
+  title: string;
+  identifier: string;
+  m3uUrl: string;
+  updatedAt: string;
+  trackCount: number;
+  episodes: Episode[];
+}
+
+const DB_CHUNK_PREFIX = "nexus_archive_chunk_";
 const DB_STORAGE_KEY_PREFIX = "nexus_archive_m3u_json_";
 const DB_INDEX_KEY = "nexus_archive_cached_channels_manifest";
+const DB_CHUNKS_INDEX_KEY = "nexus_archive_title_chunks_manifest";
 
-// 1. Cleanly extract Archive identifier from URL or input string
+// 1. Slugify helper for modular per-title .json filenames (e.g. "daily-highlights.json", "01-tv-fighting-crime.json")
+export function slugifyTitle(title: string, fallbackId: string = "channel"): string {
+  if (!title) return `${fallbackId}.json`;
+  const clean = title
+    .toLowerCase()
+    .replace(/\.m3u8?$/i, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return `${clean || fallbackId}.json`;
+}
+
+// 2. Cleanly extract Archive identifier from URL or input string
 export function parseArchiveIdentifier(input: string): string {
   const trimmed = input.trim();
   // Match archive.org/download/{id} or archive.org/details/{id} or archive.org/metadata/{id}
-  const match = trimmed.match(/archive\.org\/(?:download|details|metadata|embed)\/([^/?#]+)/i);
+  const match = trimmed.match(/archive\.org\/(?:download|details|metadata|embed|cors)\/([^/?#]+)/i);
   if (match) {
     return match[1];
   }
@@ -39,7 +63,7 @@ export function parseArchiveIdentifier(input: string): string {
   return segments[segments.length - 1] || "archive-collection";
 }
 
-// 2. Format a clean title from a filename like "70 Odd Couple.m3u"
+// 3. Format a clean human-readable title from a filename
 export function cleanTitleFromFilename(filename: string): string {
   let decoded = filename;
   try {
@@ -49,18 +73,37 @@ export function cleanTitleFromFilename(filename: string): string {
   }
   return decoded
     .replace(/\.m3u8?$/i, "")
-    .replace(/^[\d_-]+\s*/, "") // Strip leading numbers if desired, or keep legible
+    .replace(/\.(mp4|ogv|ia\.mp4|mkv|webm|ts)$/i, "")
+    .replace(/^[\d_-]+\s*/, "") // Strip leading numbers if desired
     .replace(/[_]/g, " ")
     .trim() || filename;
 }
 
-// 3. Normalize Stream URL without double-encoding and route Archive.org streams to CORS endpoints
-export function normalizeStreamUrl(url: string): string {
+// 4. Archive.org Direct File Normalization
+// Resolves /details/ URLs to raw /download/ or /cors/ paths to avoid HTML container redirects during HTML5 media playback
+export function normalizeStreamUrl(url: string, preferCorsEndpoint: boolean = true): string {
   if (!url) return "";
   let clean = url.trim();
-  if (clean.includes("archive.org/download/")) {
+
+  // Convert direct /details/{id}/{filename} to /download/{id}/{filename}
+  const detailsFileMatch = clean.match(/archive\.org\/details\/([^/?#]+)\/([^?#]+)/i);
+  if (detailsFileMatch) {
+    const id = detailsFileMatch[1];
+    const file = detailsFileMatch[2];
+    clean = `https://archive.org/download/${id}/${file}`;
+  } else {
+    // Convert /details/{id} to /download/{id}
+    const detailsMatch = clean.match(/archive\.org\/details\/([^/?#]+)(?:\/)?$/i);
+    if (detailsMatch) {
+      clean = `https://archive.org/download/${detailsMatch[1]}`;
+    }
+  }
+
+  // Convert /download/ to /cors/ if CORS-enabled direct playback is desired
+  if (preferCorsEndpoint && clean.includes("archive.org/download/")) {
     clean = clean.replace("archive.org/download/", "archive.org/cors/");
   }
+
   try {
     clean = decodeURI(clean);
   } catch {
@@ -69,7 +112,20 @@ export function normalizeStreamUrl(url: string): string {
   return encodeURI(clean).replace(/#/g, "%23");
 }
 
-// 4. Parse Raw M3U Content into Structured Episode Track JSON
+// 5. CORS Proxy URL generator for static GitHub Pages / strict CORS boundaries
+export function getCorsProxyUrls(originalUrl: string): string[] {
+  if (!originalUrl) return [];
+  const normalized = normalizeStreamUrl(originalUrl, false);
+  const encoded = encodeURIComponent(normalized);
+  return [
+    `/api/proxy?url=${encoded}`, // Local fullstack backend proxy (first priority if available)
+    `https://corsproxy.io/?${encoded}`, // Automated public CORS proxy fallback
+    `https://api.allorigins.win/raw?url=${encoded}`, // Secondary CORS proxy watchdog
+    normalized, // Direct stream as final candidate
+  ];
+}
+
+// 6. Parse Raw M3U Content into Structured Episode Track JSON
 export function parseM3uTextToEpisodes(
   rawText: string,
   fallbackGroup: string = "Archive Collection",
@@ -77,7 +133,6 @@ export function parseM3uTextToEpisodes(
 ): Episode[] {
   if (!rawText) return [];
 
-  // Normalize potential single-line / mashed M3U streams
   let normalizedText = rawText;
   if (!normalizedText.includes("\n") && normalizedText.includes("#EXTINF:")) {
     normalizedText = normalizedText
@@ -148,15 +203,15 @@ export function parseM3uTextToEpisodes(
       (trimmed.startsWith("http://") || trimmed.startsWith("https://") || trimmed.startsWith("/"))
     ) {
       const isArchive = trimmed.includes("archive.org");
-      const archiveItemMatch = trimmed.match(/archive\.org\/(?:download|details)\/([^/?#]+)/i);
+      const archiveItemMatch = trimmed.match(/archive\.org\/(?:download|details|cors)\/([^/?#]+)/i);
       const archiveItemId = archiveItemMatch ? archiveItemMatch[1] : null;
 
-      // Extract filename for fallback title if title is generic or in another language like "Канал 1"
+      // Extract filename for fallback title
       const urlFileName = trimmed.split("/").pop() || "";
       let decodedFilename = "";
       try {
         decodedFilename = decodeURIComponent(urlFileName)
-          .replace(/\.(mp4|mkv|avi|webm|ts|m3u8?)$/i, "")
+          .replace(/\.(mp4|ogv|ia\.mp4|mkv|avi|webm|ts|m3u8?)$/i, "")
           .replace(/[_\+]/g, " ")
           .trim();
       } catch {
@@ -191,6 +246,7 @@ export function parseM3uTextToEpisodes(
         finalLogo = fallbackPoster;
       }
 
+      // Normalize direct media links (resolving /details/ to raw stream URLs)
       const cleanUrl = normalizeStreamUrl(trimmed);
       const isSeries = /s\d+e\d+/i.test(finalTitle) || /s-\d+\s*ep/i.test(line) || trimmed.toLowerCase().includes(".mp4");
 
@@ -206,7 +262,7 @@ export function parseM3uTextToEpisodes(
         tvgLogo: finalLogo || undefined,
         sourceHost: isArchive ? "archive.org" : "custom-stream",
         description: isArchive
-          ? `Internet Archive classic digital stream [Item: ${archiveItemId || "media"}]`
+          ? `Internet Archive direct media stream [Item: ${archiveItemId || "media"}]`
           : undefined,
         contentType: isSeries ? "series" : "live",
         allowedPlayers: ["all"],
@@ -222,7 +278,7 @@ export function parseM3uTextToEpisodes(
   return parsed;
 }
 
-// 5. Scan an Archive.org Item/Folder for all .m3u files and generate virtual channels
+// 7. Scan Archive.org Item/Folder for all .m3u files with modular JSON DB chunk names
 export async function scanArchiveFolder(inputUrlOrId: string): Promise<ArchiveFolderScanResult> {
   const identifier = parseArchiveIdentifier(inputUrlOrId);
   let metadataJson: any = null;
@@ -245,7 +301,7 @@ export async function scanArchiveFolder(inputUrlOrId: string): Promise<ArchiveFo
         metadataJson = await res.json();
       }
     } catch {
-      // Fallback to CORS proxy
+      // Fallback to CORS proxy watchdog
       try {
         const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(`https://archive.org/metadata/${identifier}`)}`;
         const res = await fetch(proxyUrl, { signal: AbortSignal.timeout(9000) });
@@ -284,6 +340,7 @@ export async function scanArchiveFolder(inputUrlOrId: string): Promise<ArchiveFo
   const discoveredM3Us: ArchiveDiscoveredM3U[] = m3uFiles.map((file) => {
     const cleanTitle = cleanTitleFromFilename(file.name);
     const m3uUrl = `https://archive.org/download/${identifier}/${encodeURIComponent(file.name)}`;
+    const chunkFilename = slugifyTitle(cleanTitle, identifier);
     return {
       name: file.name,
       cleanTitle,
@@ -292,10 +349,11 @@ export async function scanArchiveFolder(inputUrlOrId: string): Promise<ArchiveFo
       identifier,
       groupTitle: collectionTitle,
       posterUrl,
+      chunkFilename,
     };
   });
 
-  // Create lightweight virtual channels for the player list
+  // Create lightweight virtual channels with modular JSON DB references
   const virtualChannels: Episode[] = discoveredM3Us.map((disc, idx) => {
     return {
       id: `arch-${identifier}-${idx}-${disc.name.replace(/[^a-zA-Z0-9]/g, "_").toLowerCase()}`,
@@ -310,7 +368,7 @@ export async function scanArchiveFolder(inputUrlOrId: string): Promise<ArchiveFo
       tvgName: disc.cleanTitle,
       tvgLogo: posterUrl,
       sourceHost: "archive.org",
-      description: `Virtual Channel: ${disc.cleanTitle}. Contains playlist tracks hosted on archive.org/${identifier}. Clicks unwrap tracks on demand.`,
+      description: `Virtual Channel: ${disc.cleanTitle}. Modular DB chunk: ${disc.chunkFilename}. On-demand preloading enabled.`,
       contentType: "series",
       allowedPlayers: ["player1", "player2", "all"],
       isLazy: true,
@@ -328,57 +386,96 @@ export async function scanArchiveFolder(inputUrlOrId: string): Promise<ArchiveFo
   };
 }
 
-// 6. DB Cache Layer for unwrapped M3U JSON tracks
-export function getCachedPlaylistJSON(m3uUrl: string): Episode[] | null {
+// 8. Modular Per-Title JSON Database Chunking & Storage Engine
+export function getCachedPlaylistJSON(m3uUrlOrChunkName: string): Episode[] | null {
   if (typeof window === "undefined") return null;
   try {
-    const key = DB_STORAGE_KEY_PREFIX + encodeURIComponent(m3uUrl);
-    const item = localStorage.getItem(key);
-    if (!item) return null;
-    return JSON.parse(item) as Episode[];
+    // 1. Try URL key
+    const urlKey = DB_STORAGE_KEY_PREFIX + encodeURIComponent(m3uUrlOrChunkName);
+    const item = localStorage.getItem(urlKey);
+    if (item) return JSON.parse(item) as Episode[];
+
+    // 2. Try Chunk key
+    const chunkKey = DB_CHUNK_PREFIX + encodeURIComponent(m3uUrlOrChunkName);
+    const chunkItem = localStorage.getItem(chunkKey);
+    if (chunkItem) {
+      const parsedChunk = JSON.parse(chunkItem) as TitleJsonChunk;
+      return parsedChunk.episodes;
+    }
   } catch (e) {
     console.warn("DB Read Error:", e);
-    return null;
   }
+  return null;
 }
 
-export function saveCachedPlaylistJSON(m3uUrl: string, episodes: Episode[]): void {
+export function saveCachedPlaylistJSON(
+  m3uUrl: string,
+  episodes: Episode[],
+  title?: string,
+  identifier?: string
+): void {
   if (typeof window === "undefined") return;
   try {
-    const key = DB_STORAGE_KEY_PREFIX + encodeURIComponent(m3uUrl);
-    localStorage.setItem(key, JSON.stringify(episodes));
+    const chunkFilename = slugifyTitle(title || "playlist", identifier || "archive");
 
-    // Update index manifest
+    // 1. Save standard URL key
+    const urlKey = DB_STORAGE_KEY_PREFIX + encodeURIComponent(m3uUrl);
+    localStorage.setItem(urlKey, JSON.stringify(episodes));
+
+    // 2. Save modular Per-Title .json DB Chunk
+    const chunkKey = DB_CHUNK_PREFIX + encodeURIComponent(chunkFilename);
+    const chunkData: TitleJsonChunk = {
+      chunkFilename,
+      title: title || cleanTitleFromFilename(m3uUrl),
+      identifier: identifier || parseArchiveIdentifier(m3uUrl),
+      m3uUrl,
+      updatedAt: new Date().toISOString(),
+      trackCount: episodes.length,
+      episodes,
+    };
+    localStorage.setItem(chunkKey, JSON.stringify(chunkData));
+
+    // 3. Update master index manifests
     const manifestRaw = localStorage.getItem(DB_INDEX_KEY);
     const manifest: string[] = manifestRaw ? JSON.parse(manifestRaw) : [];
     if (!manifest.includes(m3uUrl)) {
       manifest.push(m3uUrl);
       localStorage.setItem(DB_INDEX_KEY, JSON.stringify(manifest));
     }
+
+    const chunkManifestRaw = localStorage.getItem(DB_CHUNKS_INDEX_KEY);
+    const chunkManifest: string[] = chunkManifestRaw ? JSON.parse(chunkManifestRaw) : [];
+    if (!chunkManifest.includes(chunkFilename)) {
+      chunkManifest.push(chunkFilename);
+      localStorage.setItem(DB_CHUNKS_INDEX_KEY, JSON.stringify(chunkManifest));
+    }
   } catch (e) {
     console.warn("DB Write Error:", e);
   }
 }
 
-// 7. On-Demand (Lazy) Unwrapping: Checks DB first, fetches and parses M3U if needed
+// 9. On-Demand (Lazy) Unwrapping: Checks DB chunk first, fetches and parses M3U if needed
 export async function unwrapM3uOnDemand(channel: Episode): Promise<{
   episodes: Episode[];
   fromCache: boolean;
   activePlayableUrl: string;
+  chunkFilename: string;
 }> {
   const m3uUrl = channel.m3uSourceUrl || channel.url;
+  const chunkFilename = slugifyTitle(channel.title, channel.id);
 
-  // 1. Check DB Cache
+  // 1. Check DB Cache Chunk
   const cached = getCachedPlaylistJSON(m3uUrl);
   if (cached && cached.length > 0) {
     return {
       episodes: cached,
       fromCache: true,
       activePlayableUrl: cached[0].url,
+      chunkFilename,
     };
   }
 
-  // 2. Fetch M3U text: Try local server proxy first for reliable CORS bypass
+  // 2. Fetch M3U text using multi-tier proxy fallback (Local Server -> Direct -> CORS Proxy Watchdog)
   let rawText = "";
   try {
     const localProxyUrl = `/api/proxy?url=${encodeURIComponent(m3uUrl)}`;
@@ -394,7 +491,7 @@ export async function unwrapM3uOnDemand(channel: Episode): Promise<{
         rawText = await res.text();
       }
     } catch {
-      // Fallback to external CORS proxy
+      // Fallback to external CORS proxy watchdog
       try {
         const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(m3uUrl)}`;
         const res = await fetch(proxyUrl, { signal: AbortSignal.timeout(8000) });
@@ -413,6 +510,7 @@ export async function unwrapM3uOnDemand(channel: Episode): Promise<{
       episodes: [channel],
       fromCache: false,
       activePlayableUrl: channel.url,
+      chunkFilename,
     };
   }
 
@@ -420,12 +518,13 @@ export async function unwrapM3uOnDemand(channel: Episode): Promise<{
   const parsed = parseM3uTextToEpisodes(rawText, channel.groupTitle, channel.tvgLogo || undefined);
 
   if (parsed.length > 0) {
-    // 4. Save in Local DB Cache
-    saveCachedPlaylistJSON(m3uUrl, parsed);
+    // 4. Save in Local DB as modular title-specific JSON chunk
+    saveCachedPlaylistJSON(m3uUrl, parsed, channel.title, channel.id);
     return {
       episodes: parsed,
       fromCache: false,
       activePlayableUrl: parsed[0].url,
+      chunkFilename,
     };
   }
 
@@ -433,24 +532,50 @@ export async function unwrapM3uOnDemand(channel: Episode): Promise<{
     episodes: [channel],
     fromCache: false,
     activePlayableUrl: channel.url,
+    chunkFilename,
   };
 }
 
-// 8. Export Full DB to GitHub-Compatible JSON
+// 10. Background On-Demand Preloader for adjacent title JSON chunks
+export function preloadAdjacentTitleChunks(currentIdx: number, allChannels: Episode[]): void {
+  if (!allChannels || allChannels.length === 0) return;
+  const adjacentIndices = [currentIdx + 1, currentIdx + 2, currentIdx - 1].filter(
+    (i) => i >= 0 && i < allChannels.length
+  );
+
+  adjacentIndices.forEach((idx) => {
+    const ep = allChannels[idx];
+    if (ep && ep.isLazy && (ep.m3uSourceUrl || ep.url)) {
+      const m3uUrl = ep.m3uSourceUrl || ep.url;
+      const cached = getCachedPlaylistJSON(m3uUrl);
+      if (!cached) {
+        // Preload in background
+        unwrapM3uOnDemand(ep).catch(() => {});
+      }
+    }
+  });
+}
+
+// 11. Export Full DB or Modular Title JSON chunks
 export function exportAllChannelsDatabaseJSON(): string {
   if (typeof window === "undefined") return "{}";
   const manifestRaw = localStorage.getItem(DB_INDEX_KEY);
   const manifest: string[] = manifestRaw ? JSON.parse(manifestRaw) : [];
 
+  const chunkManifestRaw = localStorage.getItem(DB_CHUNKS_INDEX_KEY);
+  const chunkManifest: string[] = chunkManifestRaw ? JSON.parse(chunkManifestRaw) : [];
+
   const dbExport: {
     exportedAt: string;
     schemaVersion: string;
     totalCachedPlaylists: number;
+    chunkFiles: string[];
     playlists: Record<string, Episode[]>;
   } = {
     exportedAt: new Date().toISOString(),
-    schemaVersion: "1.0.0",
+    schemaVersion: "2.0.0",
     totalCachedPlaylists: manifest.length,
+    chunkFiles: chunkManifest,
     playlists: {},
   };
 
@@ -464,7 +589,7 @@ export function exportAllChannelsDatabaseJSON(): string {
   return JSON.stringify(dbExport, null, 2);
 }
 
-// 9. Import Full DB from GitHub raw URL or JSON string
+// 12. Import Full DB from GitHub raw URL or JSON string
 export function importChannelsDatabaseJSON(jsonString: string): number {
   try {
     const data = JSON.parse(jsonString);

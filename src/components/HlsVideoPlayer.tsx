@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import Hls from "hls.js";
-import { AlertTriangle, RefreshCw, Film, ExternalLink, Globe, Radio, Play, Volume2, VolumeX } from "lucide-react";
+import { AlertTriangle, RefreshCw, Film, ExternalLink, Globe, Radio, Play, CheckCircle2 } from "lucide-react";
+import { normalizeStreamUrl, getCorsProxyUrls } from "../utils/archiveHarvesterDB";
 
 interface HlsVideoPlayerProps {
   src: string;
@@ -9,6 +10,7 @@ interface HlsVideoPlayerProps {
   muted?: boolean;
   controls?: boolean;
   className?: string;
+  seekTime?: number;
   onTimeUpdate?: (currentTime: number, duration: number) => void;
   onError?: (error: any) => void;
   fallbackSrc?: string;
@@ -17,7 +19,7 @@ interface HlsVideoPlayerProps {
 // Extract Archive.org item identifier if present
 function getArchiveOrgDetails(url: string) {
   if (!url) return { isArchive: false, itemId: null, embedUrl: null };
-  const match = url.match(/archive\.org\/(?:download|details|embed)\/([^/?#]+)/i);
+  const match = url.match(/archive\.org\/(?:download|details|embed|cors)\/([^/?#]+)/i);
   if (match) {
     return {
       isArchive: true,
@@ -28,21 +30,6 @@ function getArchiveOrgDetails(url: string) {
   return { isArchive: false, itemId: null, embedUrl: null };
 }
 
-// Cleanly normalize URL and translate Archive.org download links to CORS-enabled streams
-function normalizeMediaUrl(url: string): string {
-  if (!url) return "";
-  let clean = url.trim();
-  if (clean.includes("archive.org/download/")) {
-    clean = clean.replace("archive.org/download/", "archive.org/cors/");
-  }
-  try {
-    clean = decodeURI(clean);
-  } catch {
-    // Keep as is
-  }
-  return encodeURI(clean).replace(/#/g, "%23");
-}
-
 export const HlsVideoPlayer: React.FC<HlsVideoPlayerProps> = ({
   src,
   autoPlay = true,
@@ -50,6 +37,7 @@ export const HlsVideoPlayer: React.FC<HlsVideoPlayerProps> = ({
   muted = false,
   controls = false,
   className = "w-full h-full object-cover",
+  seekTime,
   onTimeUpdate,
   onError,
   fallbackSrc = "https://archive.org/download/Tears-of-Steel/tears_of_steel_720p.mp4",
@@ -57,52 +45,48 @@ export const HlsVideoPlayer: React.FC<HlsVideoPlayerProps> = ({
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const hlsRef = useRef<Hls | null>(null);
-  const retryStepRef = useRef<number>(0);
+  const proxyAttemptIndexRef = useRef<number>(0);
   const animFrameRef = useRef<number | null>(null);
+  const hasAppliedInitialSeekRef = useRef<boolean>(false);
 
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [hasError, setHasError] = useState<boolean>(false);
   const [isUsingFallback, setIsUsingFallback] = useState<boolean>(false);
   const [showTestPattern, setShowTestPattern] = useState<boolean>(false);
   const [useArchiveEmbed, setUseArchiveEmbed] = useState<boolean>(false);
-  const [useProxy, setUseProxy] = useState<boolean>(false);
+  const [activeProxyUrl, setActiveProxyUrl] = useState<string | null>(null);
   const [currentResolution, setCurrentResolution] = useState<string>("1080p60");
 
-  const normalizedSrc = normalizeMediaUrl(src || fallbackSrc);
+  const normalizedSrc = normalizeStreamUrl(src || fallbackSrc);
   const archiveInfo = getArchiveOrgDetails(src || "");
 
   // Reset retry counter whenever the source changes
   useEffect(() => {
-    retryStepRef.current = 0;
+    proxyAttemptIndexRef.current = 0;
     setShowTestPattern(false);
     setUseArchiveEmbed(false);
     setIsUsingFallback(false);
+    setActiveProxyUrl(null);
     setHasError(false);
     setIsLoading(true);
   }, [src]);
 
   const handleManualRetry = () => {
-    retryStepRef.current = 0;
+    proxyAttemptIndexRef.current = 0;
     setShowTestPattern(false);
     setUseArchiveEmbed(false);
     setIsUsingFallback(false);
+    setActiveProxyUrl(null);
     setHasError(false);
     setIsLoading(true);
-  };
-
-  const handleForceArchiveEmbed = () => {
-    setShowTestPattern(false);
-    setUseArchiveEmbed(true);
-    setIsLoading(false);
-    setHasError(false);
   };
 
   const handleForceDirectPlayback = () => {
     setShowTestPattern(false);
     setUseArchiveEmbed(false);
     setIsUsingFallback(false);
-    setUseProxy(false);
-    retryStepRef.current = 0;
+    setActiveProxyUrl(null);
+    proxyAttemptIndexRef.current = 0;
     setIsLoading(true);
   };
 
@@ -132,7 +116,7 @@ export const HlsVideoPlayer: React.FC<HlsVideoPlayerProps> = ({
         "#00c0c0", // Cyan
         "#00c000", // Green
         "#c000c0", // Magenta
-        "#c00000", // Red
+        "#c000c0", // Red
         "#0000c0", // Blue
       ];
       const barW = w / barColors.length;
@@ -200,7 +184,7 @@ export const HlsVideoPlayer: React.FC<HlsVideoPlayerProps> = ({
     };
   }, [showTestPattern]);
 
-  // Main stream loading effect
+  // Main stream loading & HLS/HTML5 playback effect
   useEffect(() => {
     const video = videoRef.current;
     if (!video || useArchiveEmbed || showTestPattern) return;
@@ -214,15 +198,13 @@ export const HlsVideoPlayer: React.FC<HlsVideoPlayerProps> = ({
       hlsRef.current = null;
     }
 
-    let streamUrl = isUsingFallback ? fallbackSrc : normalizedSrc;
-    const isM3uPlaylist = (streamUrl.toLowerCase().endsWith(".m3u") || streamUrl.toLowerCase().includes(".m3u?")) && !streamUrl.toLowerCase().includes(".m3u8");
+    let streamUrl = activeProxyUrl || (isUsingFallback ? fallbackSrc : normalizedSrc);
+    const isM3uPlaylist =
+      (streamUrl.toLowerCase().endsWith(".m3u") || streamUrl.toLowerCase().includes(".m3u?")) &&
+      !streamUrl.toLowerCase().includes(".m3u8");
     if (isM3uPlaylist) {
       setIsLoading(true);
       return;
-    }
-
-    if (useProxy && streamUrl.startsWith("http")) {
-      streamUrl = `/api/proxy?url=${encodeURIComponent(streamUrl)}`;
     }
 
     const isM3u8 =
@@ -230,28 +212,42 @@ export const HlsVideoPlayer: React.FC<HlsVideoPlayerProps> = ({
       streamUrl.includes("m3u8") ||
       streamUrl.includes("/hls");
 
-    // Unified error failover handler that guarantees NO infinite loop & NO broken third-party iframes
+    // Unified CORS Relay Watchdog Failover Handler
     const handlePlaybackFailure = (reason?: string) => {
-      retryStepRef.current += 1;
-      const step = retryStepRef.current;
+      const candidates = getCorsProxyUrls(src || fallbackSrc);
+      proxyAttemptIndexRef.current += 1;
+      const nextIdx = proxyAttemptIndexRef.current;
 
-      if (!useProxy && streamUrl.startsWith("http") && step === 1) {
-        // Try streaming proxy relay first
-        setUseProxy(true);
+      // Try next CORS proxy candidate automatically
+      if (nextIdx < candidates.length - 1) {
+        const nextProxy = candidates[nextIdx];
+        setActiveProxyUrl(nextProxy);
         return;
       }
 
-      if (step <= 2 && !isUsingFallback) {
-        // Transparently engage verified broadcast fallback
+      // If all proxy candidates fail, try verified fallback stream once
+      if (!isUsingFallback) {
         setIsUsingFallback(true);
+        setActiveProxyUrl(null);
         return;
       }
 
-      // If all external sources fail, engage test broadcast generator with interactive recovery
+      // Finally, engage broadcast test pattern
       setIsLoading(false);
       setHasError(true);
       setShowTestPattern(true);
       if (onError) onError(reason || "Fallback test signal engaged");
+    };
+
+    const applyInitialSeek = () => {
+      if (seekTime && seekTime > 0 && !hasAppliedInitialSeekRef.current && video) {
+        try {
+          video.currentTime = seekTime;
+          hasAppliedInitialSeekRef.current = true;
+        } catch (e) {
+          console.warn("Initial seek error:", e);
+        }
+      }
     };
 
     if (isM3u8 && Hls.isSupported()) {
@@ -267,6 +263,7 @@ export const HlsVideoPlayer: React.FC<HlsVideoPlayerProps> = ({
 
       hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
         setIsLoading(false);
+        applyInitialSeek();
         if (data.levels && data.levels.length > 0) {
           const maxLevel = data.levels[data.levels.length - 1];
           if (maxLevel.height) setCurrentResolution(`${maxLevel.height}p`);
@@ -307,6 +304,7 @@ export const HlsVideoPlayer: React.FC<HlsVideoPlayerProps> = ({
       video.src = streamUrl;
       const onLoaded = () => {
         setIsLoading(false);
+        applyInitialSeek();
         if (autoPlay) video.play().catch(() => {});
       };
       const onErr = () => {
@@ -316,16 +314,17 @@ export const HlsVideoPlayer: React.FC<HlsVideoPlayerProps> = ({
       video.addEventListener("loadedmetadata", onLoaded, { once: true });
       video.addEventListener("error", onErr, { once: true });
     } else {
-      // Direct MP4 / WebM video stream
+      // Direct MP4 / WebM / OGV video stream (Native HTML5 Media)
       video.src = streamUrl;
       video.onloadeddata = () => {
         setIsLoading(false);
+        applyInitialSeek();
       };
       video.oncanplay = () => {
         setIsLoading(false);
+        applyInitialSeek();
       };
       video.onerror = () => {
-        // Detach error listener to prevent loops
         video.onerror = null;
         handlePlaybackFailure("Direct media error");
       };
@@ -354,7 +353,7 @@ export const HlsVideoPlayer: React.FC<HlsVideoPlayerProps> = ({
         hlsRef.current = null;
       }
     };
-  }, [normalizedSrc, fallbackSrc, autoPlay, useArchiveEmbed, useProxy, isUsingFallback, showTestPattern]);
+  }, [normalizedSrc, fallbackSrc, autoPlay, useArchiveEmbed, activeProxyUrl, isUsingFallback, showTestPattern]);
 
   return (
     <div className="relative w-full h-full flex items-center justify-center bg-black overflow-hidden group select-none">
@@ -374,7 +373,7 @@ export const HlsVideoPlayer: React.FC<HlsVideoPlayerProps> = ({
                 <span>Stream Sync Interrupted</span>
               </div>
               <p className="text-[11px] text-white/70 font-mono">
-                The stream requires decoder re-sync or proxy relay.
+                The stream requires decoder re-sync or CORS proxy relay.
               </p>
               <div className="flex flex-wrap items-center justify-center gap-2 font-mono text-xs pt-1">
                 <button
@@ -386,7 +385,8 @@ export const HlsVideoPlayer: React.FC<HlsVideoPlayerProps> = ({
                 </button>
                 <button
                   onClick={() => {
-                    setUseProxy(true);
+                    const candidates = getCorsProxyUrls(src || fallbackSrc);
+                    setActiveProxyUrl(candidates[1] || candidates[0]);
                     handleManualRetry();
                   }}
                   className="px-3 py-1.5 bg-emerald-600/80 hover:bg-emerald-600 text-white font-bold rounded-lg shadow-md flex items-center gap-1.5 cursor-pointer transition-all"
@@ -405,8 +405,16 @@ export const HlsVideoPlayer: React.FC<HlsVideoPlayerProps> = ({
             </div>
           </div>
         </div>
+      ) : useArchiveEmbed && archiveInfo.embedUrl ? (
+        /* Archive.org Native Web Player Embed IFrame */
+        <iframe
+          src={archiveInfo.embedUrl}
+          title="Archive.org Stream Player"
+          className="w-full h-full border-0"
+          allow="autoplay; fullscreen"
+        />
       ) : (
-        /* HTML5 Native / HLS Video Element */
+        /* HTML5 Native / HLS.js Video Element */
         <video
           ref={videoRef}
           autoPlay={autoPlay}
@@ -434,7 +442,14 @@ export const HlsVideoPlayer: React.FC<HlsVideoPlayerProps> = ({
           {archiveInfo.isArchive && (
             <div className="bg-[#0088FF]/90 text-white font-mono font-bold text-[10px] px-2.5 py-1 rounded-md flex items-center gap-1.5 shadow-md backdrop-blur-md">
               <Film className="w-3.5 h-3.5 text-white" />
-              <span>ARCHIVE.ORG STREAM</span>
+              <span>ARCHIVE.ORG DIRECT</span>
+            </div>
+          )}
+
+          {activeProxyUrl && (
+            <div className="bg-emerald-500/90 text-black font-mono font-bold text-[10px] px-2.5 py-1 rounded-md flex items-center gap-1.5 shadow-md">
+              <Globe className="w-3.5 h-3.5" />
+              <span>CORS PROXY ACTIVE</span>
             </div>
           )}
 
@@ -465,16 +480,23 @@ export const HlsVideoPlayer: React.FC<HlsVideoPlayerProps> = ({
           )}
 
           <button
-            onClick={() => setUseProxy(!useProxy)}
+            onClick={() => {
+              if (activeProxyUrl) {
+                setActiveProxyUrl(null);
+              } else {
+                const candidates = getCorsProxyUrls(src || fallbackSrc);
+                setActiveProxyUrl(candidates[1] || candidates[0]);
+              }
+            }}
             className={`px-2.5 py-1 rounded-md border font-bold flex items-center gap-1 transition-all cursor-pointer ${
-              useProxy
-                ? "bg-[#0088FF] border-[#0088FF] text-white"
+              activeProxyUrl
+                ? "bg-emerald-600 border-emerald-500 text-white"
                 : "bg-black/80 border-white/20 text-white/80 hover:bg-white/10"
             }`}
-            title="Route stream through server CORS bypass proxy"
+            title="Route stream through automated CORS bypass proxy watchdog"
           >
             <Globe className="w-3 h-3" />
-            <span>{useProxy ? "CORS Relay: ON" : "CORS Relay"}</span>
+            <span>{activeProxyUrl ? "CORS Relay: ON" : "CORS Relay"}</span>
           </button>
 
           <a

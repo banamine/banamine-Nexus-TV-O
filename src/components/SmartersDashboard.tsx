@@ -85,12 +85,12 @@ export const SmartersDashboard: React.FC<SmartersDashboardProps> = ({
     },
     {
       id: "epg",
-      title: "EPG GUIDE",
-      subtitle: "Linear Broadcast Matrix Grid",
+      title: "EPG MATRIX GUIDE",
+      subtitle: "24-Hour Modulo Linear Playout",
       icon: Calendar,
       color: "from-sky-600 to-blue-800",
       accent: "text-sky-400",
-      action: onOpenEPGModal,
+      action: () => onNavigate("epg"),
     },
     {
       id: "pin",

@@ -25,11 +25,19 @@ import {
   History,
   Trash2,
   Filter,
-  X
+  X,
+  FileCode,
+  Globe,
+  ArrowRight
 } from "lucide-react";
 import { Episode, WatchdogState } from "../types";
 import { HlsVideoPlayer } from "./HlsVideoPlayer";
-import { unwrapM3uOnDemand, getCachedPlaylistJSON } from "../utils/archiveHarvesterDB";
+import { 
+  unwrapM3uOnDemand, 
+  getCachedPlaylistJSON, 
+  slugifyTitle,
+  preloadAdjacentTitleChunks 
+} from "../utils/archiveHarvesterDB";
 import { 
   getStoredFavorites, 
   saveStoredFavorites, 
@@ -77,6 +85,7 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
   const [activeTrackIndex, setActiveTrackIndex] = useState<number>(0);
   const [isUnwrapping, setIsUnwrapping] = useState<boolean>(false);
   const [isServedFromDBCache, setIsServedFromDBCache] = useState<boolean>(false);
+  const [activeChunkFilename, setActiveChunkFilename] = useState<string>("");
 
   const playerContainerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -91,14 +100,19 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
     }
   }, [activeEp?.id, activeEp?.url]);
 
-  // Unpack M3U playlist lazily on channel switch
+  // Unpack M3U playlist lazily on channel switch with modular per-title JSON chunking
   useEffect(() => {
     if (!activeEp) {
       setUnwrappedTracks([]);
+      setActiveChunkFilename("");
       return;
     }
 
+    const currentIdx = episodes.findIndex(e => e.id === activeEp.id);
     const m3uUrl = activeEp.m3uSourceUrl || activeEp.url || "";
+    const chunkName = slugifyTitle(activeEp.title, activeEp.id);
+    setActiveChunkFilename(chunkName);
+
     const isM3u =
       ((m3uUrl.toLowerCase().endsWith(".m3u") || m3uUrl.toLowerCase().includes(".m3u?")) &&
         !m3uUrl.toLowerCase().includes(".m3u8")) ||
@@ -118,12 +132,18 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
           setUnwrappedTracks(res.episodes);
           setActiveTrackIndex(0);
           setIsServedFromDBCache(res.fromCache);
+          setActiveChunkFilename(res.chunkFilename);
           setIsUnwrapping(false);
         }).catch((err) => {
           console.warn("Unwrap error:", err);
           setUnwrappedTracks([activeEp]);
           setIsUnwrapping(false);
         });
+      }
+
+      // Trigger background on-demand preloader for adjacent title JSON chunks
+      if (currentIdx !== -1) {
+        preloadAdjacentTitleChunks(currentIdx, episodes);
       }
     } else {
       setUnwrappedTracks([activeEp]);
@@ -562,7 +582,7 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
                         </h4>
                         {ep.isLazy && (
                           <span className="text-[9px] font-mono px-1 py-0.2 bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 rounded shrink-0">
-                            LAZY DB
+                            MODULAR DB
                           </span>
                         )}
                       </div>
@@ -628,8 +648,8 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
                 {isUnwrapping && (
                   <div className="absolute inset-0 bg-black/70 backdrop-blur-sm flex flex-col items-center justify-center gap-2 z-30 font-mono">
                     <RefreshCw className="w-6 h-6 text-[#0088FF] animate-spin" />
-                    <span className="text-xs font-bold text-white">Unwrapping M3U Playlist into JSON DB...</span>
-                    <span className="text-[10px] text-white/50">archive.org &rarr; local channel DB</span>
+                    <span className="text-xs font-bold text-white">Unwrapping M3U into Modular JSON DB...</span>
+                    <span className="text-[10px] text-white/50">archive.org &rarr; {activeChunkFilename || "title.json"}</span>
                   </div>
                 )}
               </div>
@@ -693,7 +713,11 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
                       </button>
                     )}
                   </div>
-                  <p className="text-[11px] text-white/50 font-mono">{activeEp?.groupTitle} • DECODING HLS STREAM 1080p60</p>
+                  <p className="text-[11px] text-white/50 font-mono flex items-center gap-1.5">
+                    <span>{activeEp?.groupTitle}</span>
+                    <span>•</span>
+                    <span className="text-white/40 truncate">{unwrappedTracks[activeTrackIndex]?.title || "HLS 1080p60"}</span>
+                  </p>
                 </div>
               </div>
 
@@ -703,6 +727,12 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
                   <span className="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 flex items-center gap-1">
                     <Database className="w-3 h-3" />
                     <span>DB CACHED</span>
+                  </span>
+                )}
+                {activeChunkFilename && (
+                  <span className="px-2 py-0.5 rounded bg-[#0088FF]/20 text-[#0088FF] border border-[#0088FF]/30 flex items-center gap-1">
+                    <FileCode className="w-3 h-3" />
+                    <span className="truncate max-w-[120px]">{activeChunkFilename}</span>
                   </span>
                 )}
                 <span className="px-2 py-0.5 rounded bg-[#00FF9D]/20 text-[#00FF9D] border border-[#00FF9D]/30">4K UHD</span>
@@ -723,22 +753,33 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
           {/* UNWRAPPED ARCHIVE PLAYLIST TRACKS / MULTI-EPISODES SELECTOR */}
           {unwrappedTracks.length > 1 && (
             <div className="glass-card p-4 space-y-3 border-l-4 border-l-[#0088FF]">
-              <div className="flex items-center justify-between">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                 <div className="flex items-center gap-2">
                   <ListVideo className="w-4 h-4 text-[#0088FF]" />
                   <h3 className="text-xs font-mono font-bold text-white uppercase tracking-wider">
                     Unwrapped Playlist Episodes ({unwrappedTracks.length} Tracks In DB)
                   </h3>
                 </div>
-                <span className="text-[10px] font-mono text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20 flex items-center gap-1">
-                  <Database className="w-3 h-3" />
-                  <span>On-Demand JSON Stream</span>
-                </span>
+                <div className="flex items-center gap-2 font-mono text-[10px]">
+                  <span className="text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20 flex items-center gap-1">
+                    <Database className="w-3 h-3" />
+                    <span>On-Demand JSON Preloaded</span>
+                  </span>
+                  {activeChunkFilename && (
+                    <span className="text-cyan-400 bg-cyan-500/10 px-2 py-0.5 rounded border border-cyan-500/20 flex items-center gap-1">
+                      <FileCode className="w-3 h-3" />
+                      <span>{activeChunkFilename}</span>
+                    </span>
+                  )}
+                </div>
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-48 overflow-y-auto pr-1">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-56 overflow-y-auto pr-1">
                 {unwrappedTracks.map((trk, tIdx) => {
                   const isTrackActive = activeTrackIndex === tIdx;
+                  const isMp4 = trk.url.toLowerCase().includes(".mp4");
+                  const isM3u8 = trk.url.toLowerCase().includes(".m3u8");
+
                   return (
                     <button
                       key={trk.id || tIdx}
@@ -761,7 +802,14 @@ export const LiveTVThreeColumn: React.FC<LiveTVThreeColumnProps> = ({
                         </span>
                         <span className="truncate">{trk.title}</span>
                       </div>
-                      {isTrackActive && <Play className="w-3.5 h-3.5 text-[#00FF9D] shrink-0 fill-[#00FF9D]" />}
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <span className={`text-[9px] px-1.5 py-0.5 rounded font-mono ${
+                          isM3u8 ? "bg-purple-500/20 text-purple-300" : isMp4 ? "bg-blue-500/20 text-blue-300" : "bg-white/10 text-white/40"
+                        }`}>
+                          {isM3u8 ? "HLS" : isMp4 ? "MP4" : "STREAM"}
+                        </span>
+                        {isTrackActive && <Play className="w-3.5 h-3.5 text-[#00FF9D] shrink-0 fill-[#00FF9D]" />}
+                      </div>
                     </button>
                   );
                 })}
