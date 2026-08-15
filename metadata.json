@@ -1,0 +1,6 @@
+{
+  "name": "M3U Matrix Stripper",
+  "description": "Advanced M3U playlist management, IPTV Smarters Pro 3-column & dashboard interface, HLS linear scheduler, multi-screen video matrix, and content curation suite.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
